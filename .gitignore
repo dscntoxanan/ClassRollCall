@@ -1,0 +1,12 @@
+# build output
+dist/
+build/
+
+# private signing key / tooling
+_tools/
+*.pfx
+*.p12
+
+# OS junk
+Thumbs.db
+.DS_Store
