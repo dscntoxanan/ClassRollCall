@@ -28,6 +28,9 @@ Copy-Item $exe (Join-Path $rel 'ClassRollCall.exe') -Force
 Copy-Item $cer (Join-Path $rel 'ClassRollCall.cer') -Force
 
 # The launchers are Chinese; cmd.exe wants GBK (cp936) on a Chinese Windows.
+# NOTE: packaging\*.bat are stored as UTF-8 (no BOM) ON PURPOSE -- this loop is the
+# only place that converts them to GBK. Do NOT pre-convert the sources to GBK: they
+# would be read as UTF-8 here and come out as mojibake in the release folder.
 $gbk = [System.Text.Encoding]::GetEncoding(936)
 foreach ($b in @('install-cert.bat', 'uninstall-cert.bat')) {
     $src = [System.IO.File]::ReadAllText((Join-Path $root ('packaging\' + $b)), [System.Text.Encoding]::UTF8)
