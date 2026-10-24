@@ -80,6 +80,7 @@ location ^~ /api/ {
 | `GET` | `/api/health` | 无 | 返回 `ok` |
 | `POST` | `/api/rollcall/sync?k=<sync_key>&n=<客户端人数>` | 同步密钥 | 返回名单+权重，纯文本 |
 | `GET` | `/api/rollcall/version` | 无 | 热更新清单（`data/version.txt` 原样返回） |
+| `GET` | `/api/rollcall/stream?k=<sync_key>` | 同步密钥 | **SSE 长连接**：`rev` 一变就推 `event: changed` |
 | `POST` | `/api/admin/login` | 表单 `token` | 成功后种 Cookie |
 | `GET` | `/api/admin` | Cookie | 网页后台 |
 | `GET` | `/api/admin/state` | Cookie | 当前名单/权重 JSON |
@@ -96,7 +97,20 @@ w=1,1,5,0.3,...
 n=张三|李四|王五|...
 ```
 
-## 安全
+## 秒级推送（SSE）
+
+`/api/rollcall/stream` 是一条 **Server-Sent Events** 长连接：
+
+- 鉴权用同步密钥（客户端不是浏览器，没有 Cookie）
+- 状态里的 `rev` 每次保存/改名单都会 +1，一变就推 `event: changed`
+- 每 20 秒发一次 `: ping` 心跳，防止中间设备掐连接
+- 单连接最长 1800 秒，到点客户端会重连；同时最多 16 条
+
+客户端收到 `changed` 后立刻重新走一次 `/api/rollcall/sync` 拉数据（推送只做"通知"，不传业务数据）。
+
+> nginx 必须 `proxy_buffering off;` 且 `proxy_read_timeout` 够长，否则推送会被缓存住。
+
+## 安全'
 
 - `secret.json` 存的是 **Token 的 SHA-256**，不是 Token 原文；泄露文件不等于泄露 Token
 - 文件权限必须 `600`，且服务以非 root 用户运行（单元里是 `User=www`）

@@ -39,9 +39,13 @@ PORT = 8120
 SESSION_TTL = 12 * 3600
 MAX_WEIGHT = 100.0
 MAX_STUDENTS = 128
+MAX_STREAMS = 16          # 同时允许的 SSE 连接数
+STREAM_MAX_SECONDS = 1800 # 单条长连接最长存活时间，到点让客户端重连
 
 _lock = threading.Lock()
 _login_fail = {}          # ip -> [count, first_ts]
+_stream_lock = threading.Lock()
+_stream_count = [0]       # 当前 SSE 长连接数
 _login_fail_lock = threading.Lock()
 
 DEFAULT_STATE = {
@@ -51,6 +55,7 @@ DEFAULT_STATE = {
     "updated": 0,
     "last_sync": 0,
     "sync_count": 0,
+    "rev": 0,
 }
 
 
@@ -426,6 +431,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/rollcall/version":
             return self.version()
 
+        if path == "/api/rollcall/stream":
+            return self.stream(q)
+
         if path in ("/api/admin", "/api/admin/"):
             if not self._authed():
                 return self._send(200, LOGIN_HTML.replace("__ERROR__", ""), "text/html; charset=utf-8")
@@ -529,10 +537,72 @@ class Handler(BaseHTTPRequestHandler):
                 clean.append(round(v, 2))
             st["weights"] = clean
             st["updated"] = int(time.time())
+            st["rev"] = int(st.get("rev") or 0) + 1
             state_write(st)
         log_line("weights saved: %s" % (clean[:5],))
         return self._json(200, {"ok": True, "updated": st["updated"]})
 
+    def stream(self, q):
+        """SSE 长连接：状态里的 rev 一变就推一条，客户端收到后立刻重新同步。
+
+        客户端不是浏览器，拿不到 Cookie，所以用同步密钥鉴权；此接口只读。
+        """
+        key = (q.get("k") or [""])[0]
+        if not SYNC_KEY or not hmac.compare_digest(key, SYNC_KEY):
+            return self._send(403, "forbidden")
+
+        with _stream_lock:
+            if _stream_count[0] >= MAX_STREAMS:
+                return self._send(503, "too many streams")
+            _stream_count[0] += 1
+
+        try:
+            # 必须用 chunked：没有 Content-Length 又不分块时，WinHTTP 会一直缓冲
+            # 到连接结束才吐数据，客户端就永远收不到"实时"推送。
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache, no-store")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Transfer-Encoding", "chunked")
+            self.end_headers()
+            self.close_connection = True
+
+            def send_chunk(payload):
+                self.wfile.write(("%X\r\n" % len(payload)).encode("ascii") + payload + b"\r\n")
+                self.wfile.flush()
+
+            try:
+                send_chunk(b"retry: 3000\n\n")
+            except OSError:
+                return
+
+            with _lock:
+                last = int(state_read().get("rev") or 0)
+            idle = 0
+            deadline = time.time() + STREAM_MAX_SECONDS
+
+            while time.time() < deadline:
+                time.sleep(1)
+                with _lock:
+                    rev = int(state_read().get("rev") or 0)
+                if rev != last:
+                    last = rev
+                    try:
+                        send_chunk(("event: changed\ndata: %d\n\n" % rev).encode("utf-8"))
+                    except OSError:
+                        return
+                    idle = 0
+                else:
+                    idle += 1
+                    if idle >= 20:
+                        idle = 0
+                        try:
+                            send_chunk(b": ping\n\n")
+                        except OSError:
+                            return
+        finally:
+            with _stream_lock:
+                _stream_count[0] -= 1
     def version(self):
         """热更新清单：data/version.txt 原样返回（无缓存头）。"""
         p = os.path.join(DATA_DIR, "version.txt")
@@ -610,6 +680,7 @@ class Handler(BaseHTTPRequestHandler):
             st["names"] = clean
             st["weights"] = [float(by_name.get(n, 1.0)) for n in clean]
             st["updated"] = int(time.time())
+            st["rev"] = int(st.get("rev") or 0) + 1
             state_write(st)
 
         log_line("roster updated: %d students" % len(clean))

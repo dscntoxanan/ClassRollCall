@@ -15,6 +15,7 @@
 #define PING_MS     100   /* 需求：100ms 内拿到 ping 结果 */
 #define TCP_MS      350   /* ICMP 被墙时的兜底探测 */
 #define CONNECT_MS  800
+#define WATCH_IDLE_MS 45000  /* SSE 收不到任何字节就算断线（服务器 20s 一次心跳）*/
 #define DNS_MS      1000
 #define RESP_MAX    16384 /* 128 个 UTF-8 名字也放得下 */
 
@@ -243,4 +244,143 @@ int Net_Sync(const wchar_t *host, const wchar_t *ip, const wchar_t *key, int cou
 
     WinHttpCloseHandle(hs);
     return ok ? NET_OK : NET_FAILED;
+}
+
+/* ---------------- 长连接监听（SSE，裸 socket） ----------------
+ * 不用 WinHTTP：它对没有 Content-Length / 分块的响应会缓冲到连接结束才吐数据，
+ * 实测 WinHttpReadData 十几秒都拿不到字节。直接用 recv()，天生边到边给。 */
+
+static SOCKET ConnectTcp(DWORD ip, int port, int timeoutMs)
+{
+    SOCKET s;
+    struct sockaddr_in sa;
+    u_long nb = 1;
+
+    s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (s == INVALID_SOCKET) return INVALID_SOCKET;
+
+    ZeroMemory(&sa, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons((u_short)port);
+    sa.sin_addr.s_addr = ip;
+
+    ioctlsocket(s, FIONBIO, &nb);
+
+    if (connect(s, (struct sockaddr *)&sa, sizeof(sa)) == SOCKET_ERROR) {
+        if (WSAGetLastError() != WSAEWOULDBLOCK) { closesocket(s); return INVALID_SOCKET; }
+        {
+            fd_set wf, ef;
+            struct timeval tv;
+            FD_ZERO(&wf); FD_SET(s, &wf);
+            FD_ZERO(&ef); FD_SET(s, &ef);
+            tv.tv_sec = timeoutMs / 1000;
+            tv.tv_usec = (timeoutMs % 1000) * 1000;
+            if (select((int)s + 1, NULL, &wf, &ef, &tv) <= 0) { closesocket(s); return INVALID_SOCKET; }
+            {
+                int err = 0, len = sizeof(err);
+                getsockopt(s, SOL_SOCKET, SO_ERROR, (char *)&err, &len);
+                if (err != 0) { closesocket(s); return INVALID_SOCKET; }
+            }
+        }
+    }
+
+    nb = 0;
+    ioctlsocket(s, FIONBIO, &nb);
+    return s;
+}
+
+int Net_Watch(const wchar_t *host, const wchar_t *ip, const wchar_t *key,
+              volatile LONG *stop, void (*onChange)(void *), void *ctx)
+{
+    SOCKET s = INVALID_SOCKET;
+    struct in_addr addr;
+    char keyA[80], hostA[160], req[512];
+    char buf[512], carry[32], head[64];
+    int carryLen = 0, headLen = 0, gotStatus = 0, connected = 0, rc = 1;
+    DWORD last = GetTickCount();
+
+    if (!EnsureWinsock()) return 1;
+    if (!ParseIPv4(ip, &addr)) return 1;
+
+    WideCharToMultiByte(CP_ACP, 0, key, -1, keyA, sizeof(keyA), NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, host, -1, hostA, sizeof(hostA), NULL, NULL);
+
+    s = ConnectTcp(addr.S_un.S_addr, SYNC_PORT, TCP_MS * 3);
+    if (s == INVALID_SOCKET) return 1;
+
+    _snprintf(req, sizeof(req) - 1,
+              "GET /api/rollcall/stream?k=%s HTTP/1.1\r\n"
+              "Host: %s\r\n"
+              "Accept: text/event-stream\r\n"
+              "User-Agent: XananRollCall/1.0\r\n"
+              "Connection: close\r\n\r\n",
+              keyA, hostA);
+    req[sizeof(req) - 1] = 0;
+    if (send(s, req, (int)strlen(req), 0) <= 0) { closesocket(s); return 1; }
+
+    for (;;) {
+        fd_set rf;
+        struct timeval tv;
+
+        if (stop && InterlockedExchangeAdd(stop, 0)) { rc = 0; break; }
+
+        FD_ZERO(&rf);
+        FD_SET(s, &rf);
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
+
+        {
+            int sel = select((int)s + 1, &rf, NULL, NULL, &tv);
+            if (sel == 0) {
+                if (GetTickCount() - last > WATCH_IDLE_MS) { rc = connected ? 2 : 1; break; }
+                continue;
+            }
+            if (sel < 0) { rc = connected ? 2 : 1; break; }
+        }
+
+        {
+            int rd = recv(s, buf, (int)sizeof(buf) - 1, 0);
+            if (rd <= 0) { rc = connected ? 2 : 1; break; }
+            last = GetTickCount();
+
+            /* 先把状态行取出来：不是 200 就别当长连接用 */
+            if (!gotStatus) {
+                int copy = rd < (int)sizeof(head) - 1 - headLen ? rd : (int)sizeof(head) - 1 - headLen;
+                if (copy > 0) {
+                    memcpy(head + headLen, buf, copy);
+                    headLen += copy;
+                    head[headLen] = 0;
+                }
+                if (headLen >= 12 || strstr(head, "\r\n")) {
+                    gotStatus = 1;
+                    if (!strstr(head, " 200")) { rc = 1; break; }
+                    connected = 1;
+                }
+            }
+
+            buf[rd] = 0;
+            if (carryLen) {
+                char tmp[600];
+                int total = carryLen + rd;
+                if (total > (int)sizeof(tmp) - 1) total = (int)sizeof(tmp) - 1;
+                memcpy(tmp, carry, carryLen);
+                memcpy(tmp + carryLen, buf, rd);
+                tmp[total] = 0;
+                if (strstr(tmp, "changed")) {
+                    if (onChange) onChange(ctx);
+                }
+                carryLen = total >= 16 ? 16 : total;
+                memcpy(carry, tmp + total - carryLen, carryLen);
+            } else {
+                if (strstr(buf, "changed")) {
+                    if (onChange) onChange(ctx);
+                }
+                carryLen = rd >= 16 ? 16 : rd;
+                memcpy(carry, buf + rd - carryLen, carryLen);
+            }
+        }
+    }
+
+    closesocket(s);
+    return rc;
 }

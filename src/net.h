@@ -26,5 +26,11 @@ typedef struct {
  * 成功返回 NET_OK，结果写进 out。 */
 int Net_Sync(const wchar_t *host, const wchar_t *ip, const wchar_t *key, int count,
              NetSyncResult *out);
+/* 长连接监听（SSE）：服务器状态一变就调用 onChange，实现秒级同步。
+ *   stop  指向 volatile LONG，置 1 时尽快返回
+ *   返回  0 = 收到 stop 退出；1 = 连不上；2 = 连上后断开（建议重置退避）
+ * 回调在后台线程里执行，不要在里面做重活，PostMessage 回主线程即可。 */
+int Net_Watch(const wchar_t *host, const wchar_t *ip, const wchar_t *key,
+              volatile LONG *stop, void (*onChange)(void *), void *ctx);
 
 #endif

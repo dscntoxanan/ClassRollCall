@@ -22,7 +22,7 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.6"
+#define APP_VERSION L"1.0.7"
 #endif
 #include "net.h"
 
@@ -43,6 +43,7 @@ typedef char roster_size_check[(NET_MAX_STUDENTS == STATE_MAX && NET_NAME_WCHARS
 
 #define TIMER_ANIM   1
 #define TIMER_ROUND  2
+#define WM_STATE_CHANGED (WM_APP + 3)   /* 服务器推来"状态变了" */
 #define ANIM_TICKS   10
 #define ANIM_MS      55
 #define WM_SYNC_DONE (WM_APP + 1)
@@ -97,6 +98,7 @@ const wchar_t *g_appVersion = APP_VERSION;
 const wchar_t *g_syncIp = SYNC_IP;
 
 static HANDLE        g_syncEvent = NULL;
+static volatile LONG g_watchStop = 0;
 static volatile LONG g_syncBusy = 0;
 
 static int S(int v) { return (int)(v * g_scale + 0.5); }
@@ -427,9 +429,13 @@ static DWORD WINAPI SyncThread(LPVOID param)
         HeapFree(GetProcessHeap(), 0, sp);
 
         attempt++;
-        if (attempt >= 4) break;
-        if (WaitForSingleObject(g_syncEvent, backoff[attempt - 1]) == WAIT_OBJECT_0)
-            attempt = 0;   /* 手动 F5：立刻重试，重新计次 */
+        {
+            /* 前 3 次按 8/25/60 秒；之后每 2 分钟一直试下去，直到连上为止。
+             * 机房"先开机、后联网"很常见，不能试几次就放弃。 */
+            DWORD waitMs = (attempt <= 3) ? backoff[attempt - 1] : 120000;
+            if (WaitForSingleObject(g_syncEvent, waitMs) == WAIT_OBJECT_0)
+                attempt = 0;   /* 手动 F5 / 服务器推送：立刻重试，重新计次 */
+        }
     }
 
     InterlockedExchange(&g_syncBusy, 0);
@@ -445,6 +451,32 @@ static void KickSync(HWND hwnd)
     } else if (g_syncEvent) {
         SetEvent(g_syncEvent);
     }
+}
+
+/* ---------------- 长连接监听（SSE 推送） ---------------- */
+
+static void OnRemoteChange(void *ctx)
+{
+    PostMessageW((HWND)ctx, WM_STATE_CHANGED, 0, 0);
+}
+
+static DWORD WINAPI WatchThread(LPVOID param)
+{
+    HWND hwnd = (HWND)param;
+    static const DWORD backoff[] = { 1000, 2000, 5000, 10000, 30000, 60000 };
+    int idx = 0;
+
+    for (;;) {
+        int r;
+
+        if (InterlockedExchangeAdd(&g_watchStop, 0)) break;
+        r = Net_Watch(SYNC_HOST, SYNC_IP, SYNC_KEY, &g_watchStop, OnRemoteChange, hwnd);
+        if (InterlockedExchangeAdd(&g_watchStop, 0)) break;
+        if (r == 2) idx = 0;          /* 连上过又断：退避从头算 */
+        Sleep(backoff[idx]);
+        if (idx < 5) idx++;
+    }
+    return 0;
 }
 
 /* ---------------- 绘制 ---------------- */
@@ -707,6 +739,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         g_syncEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
         KickSync(hwnd);
+        {
+            HANDLE th = CreateThread(NULL, 0, WatchThread, (LPVOID)hwnd, 0, NULL);
+            if (th) CloseHandle(th);
+        }
         return 0;
     }
 
@@ -715,6 +751,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_PAINT:
         OnPaint(hwnd);
+        return 0;
+
+    case WM_STATE_CHANGED:
+        KickSync(hwnd);      /* 服务器状态变了：立刻重新拉一次，秒级生效 */
         return 0;
 
     case WM_TIMER:
@@ -858,6 +898,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (g_fBtn) DeleteObject(g_fBtn);
         if (g_fGlyph) DeleteObject(g_fGlyph);
         if (g_brBg) DeleteObject(g_brBg);
+        InterlockedExchange(&g_watchStop, 1);
         PostQuitMessage(0);
         return 0;
     }
