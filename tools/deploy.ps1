@@ -12,7 +12,7 @@ param(
     [Parameter(Mandatory = $true)][string]$Password,
     [string]$Token,
     [string]$HostKey = 'SHA256:PUT-YOUR-SERVER-HOSTKEY-HERE',
-    [string]$RemoteDir = '/www/wwwroot/rollcall-api'
+    [string]$RemoteDir = '/opt/rollcall-api'
 )
 
 $ErrorActionPreference = 'Continue'
@@ -97,7 +97,7 @@ Copy-Item $tmp (Join-Path $stage 'names.json') -Force
 Send-File (Join-Path $stage 'app.py') "$RemoteDir/app.py"
 Send-File (Join-Path $stage 'names.json') "$RemoteDir/data/names.json"
 Send-File (Join-Path $stage 'rollcall-api.service') '/etc/systemd/system/rollcall-api.service'
-Send-File (Join-Path $stage 'nginx-rollcall.conf') '/www/server/panel/vhost/nginx/extension/example.com/rollcall.conf'
+Send-File (Join-Path $stage 'nginx-rollcall.conf') '/etc/nginx/conf.d/rollcall.conf'
 
 Write-Host '[4/6] secret.json + permissions'
 Invoke-Remote ("echo '$secretB64' | base64 -d > $RemoteDir/secret.json && chmod 600 $RemoteDir/secret.json && chown -R www:www $RemoteDir && chmod 700 $RemoteDir/data") | Out-Host

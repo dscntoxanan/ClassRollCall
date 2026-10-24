@@ -6,14 +6,14 @@ After=network.target
 Type=simple
 User=www
 Group=www
-WorkingDirectory=/www/wwwroot/rollcall-api
-ExecStart=/usr/bin/python3 /www/wwwroot/rollcall-api/app.py
+WorkingDirectory=/opt/rollcall-api
+ExecStart=/usr/bin/python3 /opt/rollcall-api/app.py
 Restart=always
 RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
-StandardOutput=append:/www/wwwroot/rollcall-api/logs/api.log
-StandardError=append:/www/wwwroot/rollcall-api/logs/api.error.log
+StandardOutput=append:/opt/rollcall-api/logs/api.log
+StandardError=append:/opt/rollcall-api/logs/api.error.log
 
 [Install]
 WantedBy=multi-user.target

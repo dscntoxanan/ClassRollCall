@@ -63,7 +63,7 @@
 {"token_sha256": "...", "sync_key": "...", "cookie_secret": "..."}
 ```
 
-`systemd` 单元和 nginx 反向代理配置都在 `server\` 里，按需改域名即可。
+`systemd` 单元、nginx 反向代理、`gen-secret.py`（生成 secret.json）和完整部署说明都在 [`server/README.md`](server/README.md)。
 
 ## 热更新协议
 

@@ -45,7 +45,7 @@ _login_fail = {}          # ip -> [count, first_ts]
 _login_fail_lock = threading.Lock()
 
 DEFAULT_STATE = {
-    "class": "高一2618班",
+    "class": "高一(1)班",
     "names": [],
     "weights": [],
     "updated": 0,

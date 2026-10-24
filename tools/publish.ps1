@@ -10,8 +10,8 @@ param(
     [Parameter(Mandatory = $true)][string]$Server,
     [Parameter(Mandatory = $true)][string]$Password,
     [string]$HostKey = 'SHA256:PUT-YOUR-SERVER-HOSTKEY-HERE',
-    [string]$RemoteExeDir = '/www/wwwroot/WhiteShadow/download/rollcall',
-    [string]$RemoteDataDir = '/www/wwwroot/rollcall-api/data'
+    [string]$RemoteExeDir = '/var/www/download/rollcall',
+    [string]$RemoteDataDir = '/opt/rollcall-api/data'
 )
 
 $ErrorActionPreference = 'Continue'
