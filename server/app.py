@@ -434,6 +434,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/rollcall/stream":
             return self.stream(q)
 
+        if path == "/api/rollcall/rev":
+            return self.rev(q)
+
         if path in ("/api/admin", "/api/admin/"):
             if not self._authed():
                 return self._send(200, LOGIN_HTML.replace("__ERROR__", ""), "text/html; charset=utf-8")
@@ -542,6 +545,14 @@ class Handler(BaseHTTPRequestHandler):
         log_line("weights saved: %s" % (clean[:5],))
         return self._json(200, {"ok": True, "updated": st["updated"]})
 
+    def rev(self, q):
+        """只返回状态版本号（几十字节），给轮询兜底用；不写任何状态。"""
+        key = (q.get("k") or [""])[0]
+        if not SYNC_KEY or not hmac.compare_digest(key, SYNC_KEY):
+            return self._send(403, "forbidden")
+        with _lock:
+            r = int(state_read().get("rev") or 0)
+        return self._send(200, "rev=%d\n" % r)
     def stream(self, q):
         """SSE 长连接：状态里的 rev 一变就推一条，客户端收到后立刻重新同步。
 

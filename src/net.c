@@ -11,6 +11,8 @@
 
 #include "net.h"
 
+extern const wchar_t *g_appVersion;
+
 #define SYNC_PORT   80
 #define PING_MS     100   /* 需求：100ms 内拿到 ping 结果 */
 #define TCP_MS      350   /* ICMP 被墙时的兜底探测 */
@@ -149,6 +151,39 @@ static int ParseResponse(const char *resp, NetSyncResult *out)
     return out->wCount > 0 || out->nCount > 0;
 }
 
+static int HttpGetSmall(HINTERNET hc, LPCWSTR extraHdr, LPCWSTR path,
+                        char *resp, int cap)
+{
+    HINTERNET hr;
+    DWORD code = 0, len = sizeof(code);
+    int ok = 0, total = 0;
+
+    hr = WinHttpOpenRequest(hc, L"GET", path, NULL, WINHTTP_NO_REFERER,
+                            WINHTTP_DEFAULT_ACCEPT_TYPES, 0);
+    if (!hr) return 0;
+
+    if (extraHdr)
+        WinHttpAddRequestHeaders(hr, extraHdr, (DWORD)-1,
+                                 WINHTTP_ADDREQ_FLAG_ADD | WINHTTP_ADDREQ_FLAG_REPLACE);
+
+    if (WinHttpSendRequest(hr, WINHTTP_NO_ADDITIONAL_HEADERS, 0, NULL, 0, 0, 0) &&
+        WinHttpReceiveResponse(hr, NULL) &&
+        WinHttpQueryHeaders(hr, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &code, &len, WINHTTP_NO_HEADER_INDEX) &&
+        code == 200) {
+        for (;;) {
+            DWORD rd = 0;
+            if (!WinHttpReadData(hr, resp + total, (DWORD)(cap - 1 - total), &rd)) break;
+            if (rd == 0) { ok = 1; break; }
+            total += (int)rd;
+            if (total >= cap - 1) { ok = 1; break; }
+        }
+        resp[total] = 0;
+    }
+
+    WinHttpCloseHandle(hr);
+    return ok;
+}
 static int HttpPost(HINTERNET hc, LPCWSTR extraHdr, LPCWSTR path,
                     const char *body, char *resp, int cap)
 {
@@ -195,7 +230,7 @@ int Net_Sync(const wchar_t *host, const wchar_t *ip, const wchar_t *key, int cou
 
     if (!EnsureWinsock()) return NET_UNREACH;
 
-    wsprintfW(path, L"/api/rollcall/sync?k=%s&n=%d", key, count);
+    wsprintfW(path, L"/api/rollcall/sync?k=%s&n=%d&c=%s", key, count, g_appVersion ? g_appVersion : L"0");
     wsprintfW(hostHdr, L"Host: %s", host);
     strcpy(body, "RC1\n");
 
@@ -383,4 +418,64 @@ int Net_Watch(const wchar_t *host, const wchar_t *ip, const wchar_t *key,
 
     closesocket(s);
     return rc;
+}
+
+/* ---------------- 轮询兜底：只取 rev ---------------- */
+
+int Net_FetchRev(const wchar_t *host, const wchar_t *ip, const wchar_t *key, long long *rev)
+{
+    wchar_t path[256] = L"", hostHdr[160] = L"";
+    char resp[256];
+    int ok = 0;
+
+    if (!rev) return 0;
+    if (!EnsureWinsock()) return 0;
+
+    wsprintfW(path, L"/api/rollcall/rev?k=%s", key);
+    wsprintfW(hostHdr, L"Host: %s", host);
+
+    resp[0] = 0;
+
+    {
+        HINTERNET hs = WinHttpOpen(L"XananRollCall/1.0", WINHTTP_ACCESS_TYPE_NO_PROXY,
+                                   WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (hs) {
+            HINTERNET hc;
+            WinHttpSetTimeouts(hs, DNS_MS, CONNECT_MS, 1500, 2500);
+            {
+                IN_ADDR tmp;
+                const wchar_t *use = ParseIPv4(ip, &tmp) ? ip : host;
+                hc = WinHttpConnect(hs, use, SYNC_PORT, 0);
+            }
+            if (hc) {
+                if (HttpGetSmall(hc, hostHdr, path, resp, sizeof(resp))) ok = 1;
+                WinHttpCloseHandle(hc);
+            }
+            WinHttpCloseHandle(hs);
+        }
+    }
+
+    /* 直连失败就走域名 + 系统代理（校园网常见） */
+    if (!ok) {
+        HINTERNET hs2 = WinHttpOpen(L"XananRollCall/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+        if (hs2) {
+            HINTERNET hc2;
+            WinHttpSetTimeouts(hs2, DNS_MS, CONNECT_MS, 1500, 2500);
+            hc2 = WinHttpConnect(hs2, host, SYNC_PORT, 0);
+            if (hc2) {
+                if (HttpGetSmall(hc2, NULL, path, resp, sizeof(resp))) ok = 1;
+                WinHttpCloseHandle(hc2);
+            }
+            WinHttpCloseHandle(hs2);
+        }
+    }
+
+    if (!ok) return 0;
+    {
+        char *p = strstr(resp, "rev=");
+        if (!p) return 0;
+        *rev = _strtoi64(p + 4, NULL, 10);
+    }
+    return 1;
 }

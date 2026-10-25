@@ -34,3 +34,7 @@ int Net_Watch(const wchar_t *host, const wchar_t *ip, const wchar_t *key,
               volatile LONG *stop, void (*onChange)(void *), void *ctx);
 
 #endif
+
+/* 只取服务端的状态版本号（几十字节），给"长连接不通时"的轮询兜底用。
+ * 返回 1 成功、0 失败。走 WinHTTP（会尊重系统代理），和 Net_Watch 的裸 socket 互补。 */
+int Net_FetchRev(const wchar_t *host, const wchar_t *ip, const wchar_t *key, long long *rev);

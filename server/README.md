@@ -81,6 +81,7 @@ location ^~ /api/ {
 | `POST` | `/api/rollcall/sync?k=<sync_key>&n=<客户端人数>` | 同步密钥 | 返回名单+权重，纯文本 |
 | `GET` | `/api/rollcall/version` | 无 | 热更新清单（`data/version.txt` 原样返回） |
 | `GET` | `/api/rollcall/stream?k=<sync_key>` | 同步密钥 | **SSE 长连接**：`rev` 一变就推 `event: changed` |
+| `GET` | `/api/rollcall/rev?k=<sync_key>` | 同步密钥 | 只返回 `rev=N`（几十字节），轮询兜底用 |
 | `POST` | `/api/admin/login` | 表单 `token` | 成功后种 Cookie |
 | `GET` | `/api/admin` | Cookie | 网页后台 |
 | `GET` | `/api/admin/state` | Cookie | 当前名单/权重 JSON |
@@ -109,6 +110,9 @@ n=张三|李四|王五|...
 客户端收到 `changed` 后立刻重新走一次 `/api/rollcall/sync` 拉数据（推送只做"通知"，不传业务数据）。
 
 > nginx 必须 `proxy_buffering off;` 且 `proxy_read_timeout` 够长，否则推送会被缓存住。
+>
+> 客户端还有一层兜底：长连接连续 3 次连不上（校园网常见——只放行系统代理的流量，
+> 裸 socket 出不去），就退化成每 3 秒轮询一次 `/api/rollcall/rev`，约 5 分钟后再试长连接。
 
 ## 安全'
 

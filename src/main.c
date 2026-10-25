@@ -22,7 +22,7 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.7"
+#define APP_VERSION L"1.0.8"
 #endif
 #include "net.h"
 
@@ -464,7 +464,8 @@ static DWORD WINAPI WatchThread(LPVOID param)
 {
     HWND hwnd = (HWND)param;
     static const DWORD backoff[] = { 1000, 2000, 5000, 10000, 30000, 60000 };
-    int idx = 0;
+    int idx = 0, fails = 0, i;
+    long long lastRev = -1;
 
     for (;;) {
         int r;
@@ -472,7 +473,33 @@ static DWORD WINAPI WatchThread(LPVOID param)
         if (InterlockedExchangeAdd(&g_watchStop, 0)) break;
         r = Net_Watch(SYNC_HOST, SYNC_IP, SYNC_KEY, &g_watchStop, OnRemoteChange, hwnd);
         if (InterlockedExchangeAdd(&g_watchStop, 0)) break;
-        if (r == 2) idx = 0;          /* 连上过又断：退避从头算 */
+
+        if (r == 2) {                 /* 连上过又断：立刻重连，退避归零 */
+            fails = 0;
+            idx = 0;
+            lastRev = -1;
+            continue;
+        }
+
+        fails++;
+        if (fails >= 3) {
+            /* 连续 3 次连不上长连接：有些校园网只放行代理流量，裸 socket 连不出去。
+             * 退化成轮询（每 3 秒问一次 rev，几十字节），约 5 分钟后再试长连接。 */
+            for (i = 0; i < 100; i++) {
+                long long rev = 0;
+
+                if (InterlockedExchangeAdd(&g_watchStop, 0)) return 0;
+                if (Net_FetchRev(SYNC_HOST, SYNC_IP, SYNC_KEY, &rev)) {
+                    if (lastRev >= 0 && rev != lastRev)
+                        PostMessageW(hwnd, WM_STATE_CHANGED, 0, 0);
+                    lastRev = rev;
+                }
+                Sleep(3000);
+            }
+            fails = 0;
+            continue;
+        }
+
         Sleep(backoff[idx]);
         if (idx < 5) idx++;
     }
