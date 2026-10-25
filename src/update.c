@@ -284,6 +284,48 @@ static BOOL GetField(const char *text, const char *key, char *out, int cap)
 
 static BOOL DownloadAndVerify(const wchar_t *url, const wchar_t *tmp, const wchar_t *sha);
 
+/* pending 旁边记一个版本号，供"下次启动直接应用"时判断新旧 */
+static void WritePendingVersion(const wchar_t *pending, const wchar_t *ver)
+{
+    wchar_t vpath[MAX_PATH];
+    char narrow[64];
+    FILE *f;
+
+    wsprintfW(vpath, L"%s.ver", pending);
+    WideCharToMultiByte(CP_ACP, 0, ver, -1, narrow, sizeof(narrow), NULL, NULL);
+    f = _wfopen(vpath, L"wb");
+    if (!f) return;
+    fwrite(narrow, 1, strlen(narrow), f);
+    fclose(f);
+}
+
+/* 按字节取数字和点：ASCII 和 UTF-16LE 都能读（UTF-16 的高字节是 0，跳过）。
+ * 用 fgetws 读二进制流会按本地代码页转换，中文系统上直接读成乱码。 */
+static BOOL ReadPendingVersion(const wchar_t *pending, wchar_t *out, int cap)
+{
+    wchar_t vpath[MAX_PATH];
+    char buf[128];
+    FILE *f;
+    size_t n;
+    int i, k = 0;
+
+    out[0] = 0;
+    wsprintfW(vpath, L"%s.ver", pending);
+    f = _wfopen(vpath, L"rb");
+    if (!f) return FALSE;
+    n = fread(buf, 1, sizeof(buf) - 1, f);
+    fclose(f);
+    buf[n] = 0;
+
+    for (i = 0; i < (int)n && k < cap - 1; i++) {
+        char c = buf[i];
+        if (c == 0) continue;
+        if ((c >= '0' && c <= '9') || c == '.') out[k++] = (wchar_t)c;
+        else break;
+    }
+    out[k] = 0;
+    return k > 0;
+}
 static void DoCheck(void)
 {
     static char manifest[2048];
@@ -316,6 +358,7 @@ static void DoCheck(void)
     }
 
     MoveFileExW(tmp, pending, MOVEFILE_REPLACE_EXISTING);
+    WritePendingVersion(pending, wver);
 }
 
 static BOOL DownloadAndVerify(const wchar_t *url, const wchar_t *tmp, const wchar_t *sha)
@@ -348,6 +391,52 @@ void Update_StartCheck(void)
 
 /* ---------------- 退出时替换 ---------------- */
 
+/* ---------------- 启动时直接应用（改名法） ----------------
+ * Windows 不允许覆盖/删除运行中的 exe，但**允许改名**（只改目录项，不动内容）。
+ * 所以：把正在跑的 exe 改名成 .old，再把新文件改回原名，当前进程继续跑旧镜像，
+ * 下次启动加载的就是新文件 —— 不需要重启、不需要关窗口。 */
+BOOL Update_TryApplyAtStartup(void)
+{
+    wchar_t exe[MAX_PATH], pending[MAX_PATH], sidecar[MAX_PATH];
+    wchar_t newPath[MAX_PATH], oldPath[MAX_PATH], ver[64];
+
+    if (!GetModuleFileNameW(NULL, exe, MAX_PATH)) return FALSE;
+
+    /* 上次应用留下的 .old：那时它被锁着删不掉，现在可以清了 */
+    wsprintfW(oldPath, L"%s.old", exe);
+    DeleteFileW(oldPath);
+
+    PendingPath(pending, MAX_PATH);
+    if (GetFileAttributesW(pending) == INVALID_FILE_ATTRIBUTES) return FALSE;
+
+    /* 没有版本旁注（更早版本留下的）或不必当前新，就直接丢掉，避免降级 */
+    if (!ReadPendingVersion(pending, ver, 64) || CmpVer(ver, g_appVersion) <= 0) {
+        DeleteFileW(pending);
+        wsprintfW(sidecar, L"%s.ver", pending);
+        DeleteFileW(sidecar);
+        return FALSE;
+    }
+
+    wsprintfW(newPath, L"%s.new", exe);
+
+    DeleteFileW(newPath);
+    if (!CopyFileW(pending, newPath, FALSE)) return FALSE;
+
+    if (!MoveFileExW(exe, oldPath, MOVEFILE_REPLACE_EXISTING)) {
+        DeleteFileW(newPath);
+        return FALSE;                 /* 杀软拦改名之类：放弃，留给退出时替换 */
+    }
+    if (!MoveFileExW(newPath, exe, MOVEFILE_REPLACE_EXISTING)) {
+        MoveFileExW(oldPath, exe, MOVEFILE_REPLACE_EXISTING);   /* 回滚 */
+        DeleteFileW(newPath);
+        return FALSE;
+    }
+
+    DeleteFileW(pending);
+    wsprintfW(sidecar, L"%s.ver", pending);
+    DeleteFileW(sidecar);
+    return TRUE;
+}
 BOOL Update_ApplyPending(void)
 {
     wchar_t pending[MAX_PATH], exe[MAX_PATH], tmpdir[MAX_PATH], helper[MAX_PATH], cmd[2048];

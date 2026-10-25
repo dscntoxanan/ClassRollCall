@@ -14,4 +14,8 @@ BOOL Update_ApplyPending(void);
 /* 以 `--apply-update <pid> <pending> <target>` 启动时走这里，返回退出码 */
 int Update_HelperMain(LPWSTR cmdline);
 
+/* 启动时把已下好的 pending 直接换上（改名法，不需要重启当前进程）。
+ * 成功返回 TRUE——注意此时本进程仍跑在旧镜像上，新文件已就位，下次启动生效。 */
+BOOL Update_TryApplyAtStartup(void);
+
 #endif

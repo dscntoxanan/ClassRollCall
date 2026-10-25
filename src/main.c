@@ -22,7 +22,7 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.8"
+#define APP_VERSION L"1.0.9"
 #endif
 #include "net.h"
 
@@ -947,6 +947,9 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE prev, LPWSTR cmd, int show)
         LPWSTR cl = GetCommandLineW();
         if (cl && wcsstr(cl, L"--apply-update")) return Update_HelperMain(cl);
     }
+
+    /* 上次已经下好的更新：直接换上（改名法，不重启、不关窗） */
+    Update_TryApplyAtStartup();
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
