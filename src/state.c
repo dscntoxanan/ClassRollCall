@@ -31,7 +31,7 @@ static void BuildPath(wchar_t *buf, int cap)
 }
 
 void State_Load(double *w, int *n, wchar_t names[][STATE_NAME_WCHARS], int *count,
-                long long *ver, long long *roundMin, unsigned char *drawn)
+                long long *ver, long long *roundStart, unsigned char *hist, int *histN)
 {
     wchar_t path[MAX_PATH];
     char line[8192];
@@ -41,7 +41,9 @@ void State_Load(double *w, int *n, wchar_t names[][STATE_NAME_WCHARS], int *coun
     if (n) *n = 0;
     if (count) *count = 1;
     if (ver) *ver = 0;
-    if (roundMin) *roundMin = 0;
+    if (roundStart) *roundStart = 0;
+    if (histN) *histN = 0;
+    if (hist) memset(hist, 0, STATE_MAX * 3);
 
     BuildPath(path, MAX_PATH);
     f = _wfopen(path, L"rb");
@@ -56,11 +58,13 @@ void State_Load(double *w, int *n, wchar_t names[][STATE_NAME_WCHARS], int *coun
             if (v > STATE_MAX) v = STATE_MAX;
             if (n) *n = v;
         } else if (strncmp(line, "r=", 2) == 0) {
-            if (roundMin) *roundMin = _strtoi64(line + 2, NULL, 10);
-        } else if (strncmp(line, "d=", 2) == 0 && drawn) {
-            int i;
-            for (i = 0; i < STATE_MAX && line[2 + i]; i++)
-                drawn[i] = (line[2 + i] == '1') ? 1 : 0;
+            if (roundStart) *roundStart = _strtoi64(line + 2, NULL, 10);
+        } else if (strncmp(line, "d", 1) == 0 && line[1] >= '0' && line[1] <= '2' && line[2] == '=' && hist) {
+            int slot = line[1] - '0', i;
+            unsigned char *dst = hist + (size_t)slot * STATE_MAX;
+            for (i = 0; i < STATE_MAX && line[3 + i]; i++)
+                dst[i] = (line[3 + i] == '1') ? 1 : 0;
+            if (histN && slot + 1 > *histN) *histN = slot + 1;
         } else if (strncmp(line, "count=", 6) == 0) {
             if (count) *count = atoi(line + 6);
             if (*count < 1) *count = 1;
@@ -96,7 +100,7 @@ void State_Load(double *w, int *n, wchar_t names[][STATE_NAME_WCHARS], int *coun
 }
 
 void State_Save(const double *w, int n, wchar_t names[][STATE_NAME_WCHARS], int count,
-                long long ver, long long roundMin, const unsigned char *drawn)
+                long long ver, long long roundStart, const unsigned char *hist, int histN)
 {
     wchar_t path[MAX_PATH];
     wchar_t tmp[MAX_PATH];
@@ -113,11 +117,17 @@ void State_Save(const double *w, int n, wchar_t names[][STATE_NAME_WCHARS], int 
     fprintf(f, FILE_MAGIC "\n");
     fprintf(f, "count=%d\n", count);
     fprintf(f, "ver=%lld\n", ver);
-    fprintf(f, "r=%lld\n", roundMin);
+    fprintf(f, "r=%lld\n", roundStart);
     fprintf(f, "n=%d\n", n);
-    fputs("d=", f);
-    for (i = 0; i < n; i++) fputc((drawn && drawn[i]) ? '1' : '0', f);
-    fputc('\n', f);
+    {
+        int s;
+        for (s = 0; s < 3; s++) {
+            fprintf(f, "d%d=", s);
+            for (i = 0; i < n; i++)
+                fputc((s < histN && hist && hist[(size_t)s * STATE_MAX + i]) ? '1' : '0', f);
+            fputc('\n', f);
+        }
+    }
     fputs("w=", f);
     for (i = 0; i < n; i++) {
         if (i) fputc(',', f);

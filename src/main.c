@@ -22,7 +22,7 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.9"
+#define APP_VERSION L"1.0.10"
 #endif
 #include "net.h"
 
@@ -42,7 +42,8 @@ typedef char roster_size_check[(NET_MAX_STUDENTS == STATE_MAX && NET_NAME_WCHARS
 #define SYNC_KEY    L"00000000000000000000000000000000" /* 和服务端 secret.json 里的 sync_key 一致 */
 
 #define TIMER_ANIM   1
-#define TIMER_ROUND  2
+#define HIST_DRAWS    3      /* 防重复窗口：最近几次抽取 */
+#define ROUND_SECONDS 300    /* 窗口每 5 分钟清空一次 */
 #define WM_STATE_CHANGED (WM_APP + 3)   /* 服务器推来"状态变了" */
 #define ANIM_TICKS   10
 #define ANIM_MS      55
@@ -79,9 +80,10 @@ static long long g_version = 0;
 static int g_result[ROSTER_MAX];
 static int g_resultN = 0;
 
-/* 本轮（每分钟刷新）已抽到的人 */
-static unsigned char g_drawn[ROSTER_MAX];
-static long long     g_roundMin = 0;
+/* 防重复窗口：最近 HIST_DRAWS 次抽到的人；g_histN 是已填条数 */
+static unsigned char g_hist[HIST_DRAWS][ROSTER_MAX];
+static int           g_histN = 0;
+static long long     g_roundStart = 0;   /* 窗口起点（unix 秒），每 5 分钟清一次 */
 
 static int g_animTick = 0;
 static int g_animSet[ROSTER_MAX];
@@ -248,43 +250,61 @@ static int DrawableTotal(void)
     return n;
 }
 
-/* ---------------- 轮次（每分钟刷新） ---------------- */
+/* ---------------- 防重复：最近 3 次抽到的人不再出现，5 分钟清空 ---------------- */
 
-static long long CurrentMinute(void)
+#define HIST_DRAWS   3
+#define ROUND_SECONDS 300
+
+static long long NowSec(void) { return (long long)time(NULL); }
+
+/* 环里第 s 条（0 = 最旧） */
+static int HistHit(int i)
 {
-    return (long long)time(NULL) / 60;
+    int s;
+    for (s = 0; s < g_histN; s++)
+        if (g_hist[s][i]) return 1;
+    return 0;
 }
 
-/* 跨分钟就清空"本轮已抽" */
+static void RoundClear(void)
+{
+    memset(g_hist, 0, sizeof(g_hist));
+    g_histN = 0;
+    g_roundStart = NowSec();
+}
+
+/* 到 5 分钟就把窗口清空 */
 static void RoundResetIfNeeded(void)
 {
-    long long m = CurrentMinute();
-    if (m != g_roundMin) {
-        memset(g_drawn, 0, sizeof(g_drawn));
-        g_roundMin = m;
-    }
+    if (g_roundStart == 0) { RoundClear(); return; }
+    if (NowSec() - g_roundStart >= ROUND_SECONDS) RoundClear();
 }
 
-/* 下一次整分钟时醒来，刷新轮次（不是每秒轮询，空闲时几乎不耗电） */
-static void ArmRoundTimer(HWND hwnd)
+/* 把这次抽到的 k 个人推进窗口 */
+static void HistPush(const int *idx, int n)
 {
-    time_t now = time(NULL);
-    int ms = (int)((60 - (int)(now % 60)) * 1000);
-    if (ms < 1000) ms = 1000;
-    SetTimer(hwnd, TIMER_ROUND, (UINT)ms, NULL);
+    int s, i;
+
+    /* g_hist[0] 是最新一次，越往后越旧 */
+    if (g_histN < HIST_DRAWS) g_histN++;
+    for (s = g_histN - 1; s > 0; s--)
+        memcpy(g_hist[s], g_hist[s - 1], ROSTER_MAX);
+    memset(g_hist[0], 0, ROSTER_MAX);
+    for (i = 0; i < n; i++) g_hist[0][idx[i]] = 1;
 }
 
-/* 按权重不放回抽取 k 人：
- *   1) 先在本轮没抽过、概率 > 0 的人里按权重抽
- *   2) 都抽完了，才轮到概率 0 的人（"最后被刷出来"，均匀抽）
- *   3) 连 0 概率的都抽完了 → 直接开新一轮
- * 抽到的人会记进 g_drawn。 */
+/* 按权重不放回抽 k 人：
+ *   0) 先把"最近 3 次抽到过"的人排除掉
+ *   1) 在剩下的人里按权重抽（权重 > 0 的优先）
+ *   2) 权重 > 0 的都抽过了，才轮到权重 0 的（均匀抽）
+ *   3) 全被排除（人太少或抽太频繁）→ 清空窗口重来
+ * 抽到的这 k 个人会被推进滚动窗口。 */
 static int PickSet(int *out, int k)
 {
     unsigned char taken[ROSTER_MAX];
     int i, j, got = 0;
 
-    memcpy(taken, g_drawn, sizeof(taken));
+    for (i = 0; i < g_n; i++) taken[i] = (unsigned char)HistHit(i);
 
     for (j = 0; j < k; j++) {
         int cand[ROSTER_MAX], m = 0;
@@ -301,12 +321,12 @@ static int PickSet(int *out, int k)
         }
 
         if (m == 0) {
-            /* 全员都抽过了：开新一轮，但别把本次已抽到的又抽一遍 */
-            memset(taken, 0, sizeof(taken));
+            /* 最近 3 次的都排除了还是没人：清空窗口，但别把本次已抽到的又抽一遍 */
+            memset(g_hist, 0, sizeof(g_hist));
+            g_histN = 0;
             for (i = 0; i < got; i++) taken[out[i]] = 1;
-            for (i = 0; i < g_n; i++) {
+            for (i = 0; i < g_n; i++)
                 if (!taken[i] && g_w[i] > 0) { cand[m++] = i; total += g_w[i]; }
-            }
             if (m == 0) {
                 for (i = 0; i < g_n; i++)
                     if (!taken[i]) cand[m++] = i;
@@ -330,10 +350,9 @@ static int PickSet(int *out, int k)
         out[got++] = pick;
     }
 
-    memcpy(g_drawn, taken, sizeof(g_drawn));
+    if (got > 0) HistPush(out, got);
     return got;
 }
-
 /* 动画用：从全体里均匀挑 k 个不重复的（不看权重） */
 static void PickUniformSet(int *out, int k)
 {
@@ -365,7 +384,7 @@ static void Toast(const wchar_t *msg)
 
 static void SaveNow(void)
 {
-    State_Save(g_w, g_n, g_names, g_count, g_version, g_roundMin, g_drawn);
+    State_Save(g_w, g_n, g_names, g_count, g_version, g_roundStart, &g_hist[0][0], g_histN);
 }
 
 static void BeginRoll(void)
@@ -753,14 +772,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_n = ROSTER_COUNT;
         {
             int cachedN = 0;
-            State_Load(g_w, &cachedN, g_names, &g_count, &g_version, &g_roundMin, g_drawn);
+            State_Load(g_w, &cachedN, g_names, &g_count, &g_version, &g_roundStart, &g_hist[0][0], &g_histN);
             if (cachedN > 0 && cachedN <= ROSTER_MAX) g_n = cachedN;
         }
         if (g_count < 1) g_count = 1;
         if (g_count > PickLimit()) g_count = PickLimit();
 
-        RoundResetIfNeeded();   /* 缓存里的轮次如果已经跨分钟，直接作废 */
-        ArmRoundTimer(hwnd);
+        RoundResetIfNeeded();   /* 窗口过期就清掉 */
 
         ImmAssociateContext(hwnd, NULL);
 
@@ -785,12 +803,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_TIMER:
-        if (wp == TIMER_ROUND) {
-            RoundResetIfNeeded();          /* 跨分钟 → 新一轮 */
-            InvalidateRect(hwnd, NULL, FALSE);
-            ArmRoundTimer(hwnd);
-            return 0;
-        }
         if (wp == TIMER_ANIM) {
             g_animTick++;
             if (g_animTick <= ANIM_TICKS) {
