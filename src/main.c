@@ -22,7 +22,7 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.11"
+#define APP_VERSION L"1.0.12"
 #endif
 #include "net.h"
 
@@ -43,6 +43,7 @@ typedef char roster_size_check[(NET_MAX_STUDENTS == STATE_MAX && NET_NAME_WCHARS
 
 #define TIMER_ANIM   1
 #define HIST_MAX     20      /* 防重复窗口最多记几次（服务端可调，0 = 关闭）*/
+#define MAX_PICK_ABS 20      /* 一次最多抽几人的硬上限 */
 #define WM_STATE_CHANGED (WM_APP + 3)   /* 服务器推来"状态变了" */
 #define ANIM_TICKS   10
 #define ANIM_MS      55
@@ -87,6 +88,17 @@ static int           g_histMax = 3;        /* 0 = 关闭防重复 */
 static long long     g_roundStart = 0;     /* 窗口起点（unix 秒） */
 static int           g_roundSeconds = 300; /* 窗口多久清空一次 */
 
+/* 其余后台可调项 */
+static int           g_maxPick = 5;        /* 一次最多抽几人 */
+static int           g_defaultCount = 1;   /* 新机器默认抽几人 */
+static int           g_fresh = 0;          /* 1 = 还没读过本地状态（首次运行） */
+static wchar_t       g_className[64] = CLASS_NAME;
+
+/* 指定下一位：nextId 变了才算"新的一次指定" */
+static wchar_t       g_nextName[NAME_LEN] = L"";
+static int           g_nextId = 0;
+static int           g_nextUsed = 0;
+
 static int g_animTick = 0;
 static int g_animSet[ROSTER_MAX];
 static int g_animN = 0;
@@ -110,7 +122,11 @@ static int S(int v) { return (int)(v * g_scale + 0.5); }
 /* 单次可选人数上限：最多 5 人，也不会超过总人数 */
 static int PickLimit(void)
 {
-    return g_n < MAX_PICK ? g_n : MAX_PICK;
+    int lim = g_maxPick;
+
+    if (lim < 1) lim = 1;
+    if (lim > MAX_PICK_ABS) lim = MAX_PICK_ABS;
+    return g_n < lim ? g_n : lim;
 }
 
 /* ---------------- 基础绘制 ---------------- */
@@ -309,7 +325,20 @@ static int PickSet(int *out, int k)
 
     for (i = 0; i < g_n; i++) taken[i] = (unsigned char)HistHit(i);
 
-    for (j = 0; j < k; j++) {
+    /* 后台指定了"下一位"：不管防重复窗口，先把这个人放进结果 */
+    if (g_nextName[0] && !g_nextUsed && got < k) {
+        int fi = -1;
+
+        for (i = 0; i < g_n; i++)
+            if (lstrcmpiW(g_names[i], g_nextName) == 0) { fi = i; break; }
+        g_nextUsed = 1;                 /* 用一次就作废 */
+        if (fi >= 0) {
+            taken[fi] = 1;
+            out[got++] = fi;
+        }
+    }
+
+    for (j = got; j < k; j++) {
         int cand[ROSTER_MAX], m = 0;
         double total = 0.0, r;
         int pick;
@@ -387,7 +416,27 @@ static void Toast(const wchar_t *msg)
 
 static void SaveNow(void)
 {
-    State_Save(g_w, g_n, g_names, g_count, g_version, g_roundStart, g_roundSeconds, g_histMax, &g_hist[0][0], g_histN);
+    static StateData sd;
+
+    memset(&sd, 0, sizeof(sd));
+    sd.n = g_n;
+    sd.count = g_count;
+    sd.ver = g_version;
+    sd.haveWeights = 1;
+    sd.roundStart = g_roundStart;
+    sd.roundSeconds = g_roundSeconds;
+    sd.histMax = g_histMax;
+    sd.maxPick = g_maxPick;
+    sd.defaultCount = g_defaultCount;
+    sd.nextId = g_nextId;
+    sd.nextUsed = g_nextUsed;
+    sd.histN = g_histN;
+    memcpy(sd.w, g_w, sizeof(double) * (g_n > 0 ? g_n : 0));
+    memcpy(sd.hist, g_hist, sizeof(g_hist));
+    lstrcpynW(sd.className, g_className, STATE_CLASS_WCHARS);
+    lstrcpynW(sd.nextName, g_nextName, STATE_NAME_WCHARS);
+
+    State_Save(&sd, g_names);
 }
 
 static void BeginRoll(void)
@@ -606,8 +655,11 @@ static void DrawScene(HDC dc, const RECT *rc)
     SetBkMode(dc, TRANSPARENT);
 
     /* 左上：班级名（轮次完全隐性，不显示剩余人数） */
-    TextRect(dc, g_fTitle, C_SUB, CLASS_NAME L" · 随机点名", L.rcTitle,
-             DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    {
+        wchar_t title[96];
+        wsprintfW(title, L"%s · 随机点名", g_className);
+        TextRect(dc, g_fTitle, C_SUB, title, L.rcTitle, DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+    }
 
     /* 结果区 */
     if (g_animTick > 0) {
@@ -732,6 +784,32 @@ static void ApplySync(NetSyncResult *sp)
         changed = 1;
     }
 
+    if (sp->maxPick >= 1 && sp->maxPick <= MAX_PICK_ABS && sp->maxPick != g_maxPick) {
+        g_maxPick = sp->maxPick;
+        if (g_count > PickLimit()) g_count = PickLimit();
+        changed = 1;
+    }
+    if (sp->defaultCount >= 1 && sp->defaultCount <= MAX_PICK_ABS &&
+        sp->defaultCount != g_defaultCount) {
+        g_defaultCount = sp->defaultCount;
+        changed = 1;
+    }
+    if (g_fresh) {                    /* 首次运行：用后台配的默认人数 */
+        g_count = g_defaultCount > PickLimit() ? PickLimit() : g_defaultCount;
+        g_fresh = 0;
+        changed = 1;
+    }
+    if (sp->className[0] && lstrcmpW(sp->className, g_className) != 0) {
+        lstrcpynW(g_className, sp->className, 64);
+        changed = 1;
+    }
+    if (sp->nextId != g_nextId) {      /* 后台重新指定了"下一位" */
+        g_nextId = sp->nextId;
+        lstrcpynW(g_nextName, sp->nextName, NAME_LEN);
+        g_nextUsed = 0;
+        changed = 1;
+    }
+
     g_version = sp->ver;
     if (changed) SaveNow();
     InvalidateRect(g_hwnd, NULL, FALSE);
@@ -784,13 +862,37 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* 先用编译进 exe 的名单兜底，再用本机缓存覆盖（缓存里有上次同步到的服务器名单） */
         for (i = 0; i < ROSTER_COUNT; i++) {
             lstrcpynW(g_names[i], kRosterNames[i], NAME_LEN);
-            g_w[i] = 1.0;
+            g_w[i] = (i < ROSTER_COUNT) ? kRosterWeights[i] : 1.0;
         }
         g_n = ROSTER_COUNT;
+        g_fresh = State_Exists() ? 0 : 1;
         {
+            static StateData sd;
             int cachedN = 0;
-            State_Load(g_w, &cachedN, g_names, &g_count, &g_version, &g_roundStart, &g_roundSeconds, &g_histMax, &g_hist[0][0], &g_histN);
-            if (cachedN > 0 && cachedN <= ROSTER_MAX) g_n = cachedN;
+
+            memset(&sd, 0, sizeof(sd));
+            State_Load(&sd, g_names, &cachedN);
+
+            if (cachedN > 0 && cachedN <= ROSTER_MAX) {
+                g_n = cachedN;
+                if (sd.haveWeights) {
+                    for (i = 0; i < g_n && i < STATE_MAX; i++)
+                        if (sd.w[i] >= 0) g_w[i] = sd.w[i];
+                }
+            }
+            if (sd.count >= 1) g_count = sd.count;
+            g_version = sd.ver;
+            g_roundStart = sd.roundStart;
+            if (sd.roundSeconds > 0) g_roundSeconds = sd.roundSeconds;
+            if (sd.histMax >= 0 && sd.histMax <= HIST_MAX) g_histMax = sd.histMax;
+            if (sd.maxPick >= 1 && sd.maxPick <= MAX_PICK_ABS) g_maxPick = sd.maxPick;
+            if (sd.defaultCount >= 1 && sd.defaultCount <= MAX_PICK_ABS) g_defaultCount = sd.defaultCount;
+            g_nextId = sd.nextId;
+            g_nextUsed = sd.nextUsed;
+            if (sd.className[0]) lstrcpynW(g_className, sd.className, STATE_CLASS_WCHARS);
+            lstrcpynW(g_nextName, sd.nextName, STATE_NAME_WCHARS);
+            memcpy(g_hist, sd.hist, sizeof(g_hist));
+            g_histN = sd.histN;
         }
         if (g_count < 1) g_count = 1;
         if (g_count > PickLimit()) g_count = PickLimit();

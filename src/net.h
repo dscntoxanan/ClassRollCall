@@ -14,6 +14,12 @@ typedef struct {
     long long ver;
     int roundSeconds;                            /* 防重复窗口多久清空（秒）；0 = 服务端没给 */
     int histDraws;                               /* 最近几次不重复；0 = 关闭 */
+    int maxPick;                                 /* 一次最多抽几人 */
+    int defaultCount;                            /* 新机器默认抽几人 */
+    int weightMax;                               /* 权重上限 */
+    int nextId;                                  /* 指定编号：变了才会重新指定 */
+    wchar_t className[64];                       /* 班级名（空 = 用内置的） */
+    wchar_t nextName[NET_NAME_WCHARS];           /* 指定下一位（空 = 不指定） */
     int wCount;
     double w[NET_MAX_STUDENTS];
     int nCount;                                  /* 0 表示服务器没下发名单 */

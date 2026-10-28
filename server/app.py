@@ -58,6 +58,11 @@ DEFAULT_STATE = {
     "rev": 0,
     "round_seconds": 300,     # 防重复窗口多久清空一次（秒）
     "hist_draws": 3,          # 最近几次抽取不重复；0 = 关闭
+    "max_pick": 5,            # 一次最多抽几人
+    "default_count": 1,       # 新机器第一次打开时默认抽几人
+    "weight_max": 100,        # 权重上限
+    "next_name": "",          # 指定下一位（空 = 不指定）
+    "next_id": 0,             # 指定编号：每设一次 +1，客户端据此判断"是新的一次"
 }
 
 
@@ -109,6 +114,27 @@ def state_read():
     except (TypeError, ValueError):
         hd = 3
     st["hist_draws"] = max(0, min(20, hd))
+    try:
+        mp = int(st.get("max_pick", 5))
+    except (TypeError, ValueError):
+        mp = 5
+    st["max_pick"] = max(1, min(20, mp))
+    try:
+        dc = int(st.get("default_count", 1))
+    except (TypeError, ValueError):
+        dc = 1
+    st["default_count"] = max(1, min(20, dc))
+    try:
+        wm = int(st.get("weight_max", 100))
+    except (TypeError, ValueError):
+        wm = 100
+    st["weight_max"] = max(1, min(1000, wm))
+    if not isinstance(st.get("next_name"), str):
+        st["next_name"] = ""
+    try:
+        st["next_id"] = int(st.get("next_id") or 0)
+    except (TypeError, ValueError):
+        st["next_id"] = 0
     return st
 
 
@@ -242,6 +268,9 @@ PANEL_HTML = """<!doctype html>
   .cfg input{width:66px;height:32px;text-align:center;border:1px solid var(--line);border-radius:8px;
        font:inherit;background:#fff;outline:none;font-variant-numeric:tabular-nums}
   .cfg input:focus{border-color:#c9c6bd}
+  .cfg select{height:32px;padding:0 8px;border:1px solid var(--line);border-radius:8px;font:inherit;
+       background:#fff;outline:none;max-width:180px}
+  .cfg .meta{font-size:12px}
   .cfg b{color:var(--fg);font-weight:600}
   .del{height:26px;padding:0 8px;background:transparent;color:var(--sub);border:1px solid var(--line);
        border-radius:7px;font-size:13px;line-height:1}
@@ -256,6 +285,22 @@ PANEL_HTML = """<!doctype html>
   <div class="cfg">
     <label>最近 <input id="cfg_draws" type="number" min="0" max="20" step="1" value="__HD__"> 次抽取不重复</label>
     <label>每 <input id="cfg_round" type="number" min="1" max="1440" step="1" value="__RSM__"> 分钟清空窗口</label>
+  </div>
+  <div class="cfg">
+    <label>每次最多抽 <input id="cfg_mp" type="number" min="1" max="20" step="1" value="__MP__"> 人</label>
+    <label>默认 <input id="cfg_dc" type="number" min="1" max="20" step="1" value="__DC__"> 人</label>
+    <label>权重上限 <input id="cfg_wm" type="number" min="1" max="1000" step="1" value="__WM__"></label>
+  </div>
+  <div class="cfg">
+    <label>班级名 <input id="cfg_class" type="text" maxlength="40" value="__CLASS_EDIT__" style="width:180px;text-align:left"></label>
+  </div>
+  <div class="cfg">
+    <label>指定下一位
+      <select id="cfg_next"><option value="">（不指定）</option></select>
+    </label>
+    <button class="ghost" id="nextset" style="height:32px;padding:0 14px">设为下一位</button>
+    <button class="ghost" id="nextclear" style="height:32px;padding:0 14px">取消指定</button>
+    <span class="meta" id="nextnow"></span>
   </div>
   <div class="addbar">
     <input id="newname" maxlength="12" placeholder="输入姓名，回车或点添加">
@@ -275,6 +320,7 @@ PANEL_HTML = """<!doctype html>
 <script>
 const NAMES = __NAMES__;
 const WEIGHTS = __WEIGHTS__;
+const NEXT_NAME = __NEXT__;
 const list = document.getElementById('list');
 const toast = document.getElementById('toast');
 
@@ -336,11 +382,32 @@ document.getElementById('save').onclick=async ()=>{
   const cfgR=document.getElementById('cfg_round');
   let hd=parseInt(cfgD.value,10); if(!isFinite(hd)) hd=3; hd=Math.max(0,Math.min(20,hd));
   let rm=parseInt(cfgR.value,10); if(!isFinite(rm)) rm=5; rm=Math.max(1,Math.min(1440,rm));
+  const num=(id,dflt,lo,hi)=>{
+    let v=parseInt((document.getElementById(id)||{}).value,10);
+    if(!isFinite(v)) v=dflt; return Math.max(lo,Math.min(hi,v)); };
+  const mp=num('cfg_mp',5,1,20), dc=num('cfg_dc',1,1,20), wm=num('cfg_wm',100,1,1000);
+  const cls=(document.getElementById('cfg_class')||{}).value||'';
   const r=await fetch('/api/admin/save',{method:'POST',headers:{'Content-Type':'application/json','X-RC':'1'},
-     body:JSON.stringify({weights, hist_draws:hd, round_seconds:rm*60})});
+     body:JSON.stringify({weights, hist_draws:hd, round_seconds:rm*60,
+                          max_pick:mp, default_count:dc, weight_max:wm, class:cls})});
   if(r.ok){ showToast('已保存，客户端立刻生效'); }
   else { showToast('保存失败：'+r.status); }
 };
+
+const selNext=document.getElementById('cfg_next');
+NAMES.forEach(n=>{ const o=document.createElement('option'); o.value=n; o.textContent=n; selNext.appendChild(o); });
+if(NEXT_NAME) selNext.value=NEXT_NAME;
+document.getElementById('nextnow').textContent = NEXT_NAME ? ('当前：'+NEXT_NAME) : '';
+
+async function setNext(name){
+  const r=await fetch('/api/admin/next',{method:'POST',headers:{'Content-Type':'application/json','X-RC':'1'},
+     body:JSON.stringify({name})});
+  if(r.ok){ showToast(name?('下一位：'+name):'已取消指定'); setTimeout(()=>location.reload(),500); }
+  else { showToast('设置失败：'+r.status); }
+}
+document.getElementById('nextset').onclick=()=>{
+  const v=selNext.value; if(!v){ showToast('先选一个人'); return; } setNext(v); };
+document.getElementById('nextclear').onclick=()=>setNext('');
 
 document.getElementById('reset').onclick=()=>{
   list.querySelectorAll('input').forEach(i=>i.value='1');
@@ -365,6 +432,11 @@ def admin_html(st):
     html = html.replace("__LAST__", last_s)
     html = html.replace("__NAMES__", json.dumps(names, ensure_ascii=False).replace("</", "<\\/"))
     html = html.replace("__WEIGHTS__", json.dumps([round(float(x), 2) for x in weights]))
+    html = html.replace("__MP__", str(int(st.get("max_pick") or 5)))
+    html = html.replace("__DC__", str(int(st.get("default_count") or 1)))
+    html = html.replace("__WM__", str(int(st.get("weight_max") or 100)))
+    html = html.replace("__CLASS_EDIT__", escape_html(st.get("class") or ""))
+    html = html.replace("__NEXT__", json.dumps(st.get("next_name") or "", ensure_ascii=False).replace("</", "<\\/"))
     html = html.replace("__HD__", str(int(st.get("hist_draws") or 0)))
     html = html.replace("__RSM__", str(max(1, int(st.get("round_seconds") or 300) // 60)))
     return html
@@ -510,6 +582,9 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/roster":
             return self.roster()
 
+        if path == "/api/admin/next":
+            return self.next_person()
+
         return self._send(404, "not found")
 
     # -- endpoints -------------------------------------------------------
@@ -557,7 +632,9 @@ class Handler(BaseHTTPRequestHandler):
         round_seconds = payload.get("round_seconds")
         hist_draws = payload.get("hist_draws")
 
-        if weights is None and round_seconds is None and hist_draws is None:
+        if (weights is None and round_seconds is None and hist_draws is None
+                and payload.get("max_pick") is None and payload.get("default_count") is None
+                and payload.get("weight_max") is None and payload.get("class") is None):
             return self._json(400, {"ok": False, "error": "nothing to save"})
 
         with _lock:
@@ -592,6 +669,30 @@ class Handler(BaseHTTPRequestHandler):
                     st["hist_draws"] = max(0, min(20, int(hist_draws)))
                 except (TypeError, ValueError):
                     return self._json(400, {"ok": False, "error": "bad hist_draws"})
+
+            if "max_pick" in payload and payload["max_pick"] is not None:
+                try:
+                    st["max_pick"] = max(1, min(20, int(payload["max_pick"])))
+                except (TypeError, ValueError):
+                    return self._json(400, {"ok": False, "error": "bad max_pick"})
+
+            if "default_count" in payload and payload["default_count"] is not None:
+                try:
+                    st["default_count"] = max(1, min(20, int(payload["default_count"])))
+                except (TypeError, ValueError):
+                    return self._json(400, {"ok": False, "error": "bad default_count"})
+
+            if "weight_max" in payload and payload["weight_max"] is not None:
+                try:
+                    st["weight_max"] = max(1, min(1000, float(payload["weight_max"])))
+                except (TypeError, ValueError):
+                    return self._json(400, {"ok": False, "error": "bad weight_max"})
+
+            if "class" in payload and payload["class"] is not None:
+                cls = str(payload["class"]).strip()
+                if not cls or len(cls) > 40:
+                    return self._json(400, {"ok": False, "error": "bad class name"})
+                st["class"] = cls
 
             st["updated"] = int(time.time())
             st["rev"] = int(st.get("rev") or 0) + 1
@@ -709,14 +810,47 @@ class Handler(BaseHTTPRequestHandler):
             st["sync_count"] = int(st.get("sync_count") or 0) + 1
             state_write(st)
 
-        body = "RC1\nv=%d\nrs=%d\nhd=%d\nw=%s\n" % (
+        body = "RC1\nv=%d\nrs=%d\nhd=%d\nmp=%d\ndc=%d\nwm=%d\nnxi=%d\n" % (
             int(time.time()),
             int(st.get("round_seconds") or 300),
             int(st.get("hist_draws") or 0),
-            ",".join("%.4g" % float(w) for w in (st.get("weights") or [])))
+            int(st.get("max_pick") or 5),
+            int(st.get("default_count") or 1),
+            int(st.get("weight_max") or 100),
+            int(st.get("next_id") or 0))
+        body += "cn=%s\n" % (st.get("class") or "")
+        if st.get("next_name"):
+            body += "nx=%s\n" % st["next_name"]
+        body += "w=%s\n" % ",".join("%.4g" % float(w) for w in (st.get("weights") or []))
         if st.get("names"):
             body += "n=%s\n" % "|".join(st["names"])
         return self._send(200, body, "text/plain; charset=utf-8")
+
+    def next_person(self):
+        """指定下一位抽到的人（name 为空则取消指定）。"""
+        if not self._authed():
+            return self._json(401, {"ok": False, "error": "unauthorized"})
+        if self.headers.get("X-RC") != "1":
+            return self._json(403, {"ok": False, "error": "csrf"})
+        try:
+            payload = json.loads(self._body().decode("utf-8"))
+            name = str(payload.get("name") or "").strip()
+        except (ValueError, KeyError):
+            return self._json(400, {"ok": False, "error": "bad json"})
+
+        with _lock:
+            st = state_read()
+            names = st.get("names") or []
+            if name and name not in names:
+                return self._json(400, {"ok": False, "error": "no such student"})
+            st["next_name"] = name
+            st["next_id"] = int(st.get("next_id") or 0) + 1
+            st["updated"] = int(time.time())
+            st["rev"] = int(st.get("rev") or 0) + 1
+            state_write(st)
+
+        log_line("next person: %s" % (name or "(cleared)"))
+        return self._json(200, {"ok": True, "next_name": name, "next_id": st["next_id"]})
 
     def roster(self):
         """整份替换名单：新增 / 删除都走这里；同名的人保留原权重。"""

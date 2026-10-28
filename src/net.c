@@ -134,6 +134,26 @@ static void ParseNames(const char *p, NetSyncResult *out)
     out->nCount = n;
 }
 
+/* 取一条 "key=值" 的 UTF-8 文本行并转成宽字符；返回值 1 表示这行存在 */
+static int ParseWideLine(const char *resp, const char *key, wchar_t *out, int cap)
+{
+    const char *p, *e;
+    int n;
+
+    if (cap > 0) out[0] = 0;
+    p = strstr(resp, key);
+    if (!p) return 0;
+    p += strlen(key);
+    e = p;
+    while (*e && *e != '\r' && *e != '\n') e++;
+    n = (int)(e - p);
+    if (n > 0 && cap > 1) {
+        if (n > cap - 1) n = cap - 1;
+        MultiByteToWideChar(CP_UTF8, 0, p, n, out, cap - 1);
+        out[n] = 0;
+    }
+    return 1;
+}
 static int ParseResponse(const char *resp, NetSyncResult *out)
 {
     const char *pv = strstr(resp, "\nv=");
@@ -148,8 +168,18 @@ static int ParseResponse(const char *resp, NetSyncResult *out)
     {
         const char *prs = strstr(resp, "\nrs=");
         const char *phd = strstr(resp, "\nhd=");
+        const char *pmp = strstr(resp, "\nmp=");
+        const char *pdc = strstr(resp, "\ndc=");
+        const char *pwm = strstr(resp, "\nwm=");
+        const char *pnx = strstr(resp, "\nnxi=");
         if (prs) out->roundSeconds = (int)_strtoi64(prs + 4, NULL, 10);
         if (phd) out->histDraws = (int)_strtoi64(phd + 4, NULL, 10);
+        if (pmp) out->maxPick = (int)_strtoi64(pmp + 4, NULL, 10);
+        if (pdc) out->defaultCount = (int)_strtoi64(pdc + 4, NULL, 10);
+        if (pwm) out->weightMax = (int)_strtoi64(pwm + 4, NULL, 10);
+        if (pnx) out->nextId = (int)_strtoi64(pnx + 5, NULL, 10);
+        ParseWideLine(resp, "\ncn=", out->className, 64);
+        ParseWideLine(resp, "\nnx=", out->nextName, NET_NAME_WCHARS);
     }
 
     ParseWeights(pw + 3, out);
