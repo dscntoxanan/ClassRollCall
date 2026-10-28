@@ -56,6 +56,8 @@ DEFAULT_STATE = {
     "last_sync": 0,
     "sync_count": 0,
     "rev": 0,
+    "round_seconds": 300,     # 防重复窗口多久清空一次（秒）
+    "hist_draws": 3,          # 最近几次抽取不重复；0 = 关闭
 }
 
 
@@ -95,6 +97,18 @@ def state_read():
     if len(w) < n:
         w = list(w) + [1.0] * (n - len(w))
     st["weights"] = w[:n] if n else w
+
+    # 自定义项：夹到合理范围，坏值直接回默认
+    try:
+        rs = int(st.get("round_seconds", 300))
+    except (TypeError, ValueError):
+        rs = 300
+    st["round_seconds"] = max(10, min(86400, rs))
+    try:
+        hd = int(st.get("hist_draws", 3))
+    except (TypeError, ValueError):
+        hd = 3
+    st["hist_draws"] = max(0, min(20, hd))
     return st
 
 
@@ -222,6 +236,13 @@ PANEL_HTML = """<!doctype html>
        font:inherit;background:#fff;outline:none}
   .addbar input:focus{border-color:#c9c6bd}
   .addbar button{height:38px;padding:0 16px}
+  .cfg{display:flex;flex-wrap:wrap;gap:10px 18px;align-items:center;padding:13px 4px;
+       border-bottom:1px solid var(--line);color:var(--sub);font-size:13px}
+  .cfg label{display:flex;align-items:center;gap:7px}
+  .cfg input{width:66px;height:32px;text-align:center;border:1px solid var(--line);border-radius:8px;
+       font:inherit;background:#fff;outline:none;font-variant-numeric:tabular-nums}
+  .cfg input:focus{border-color:#c9c6bd}
+  .cfg b{color:var(--fg);font-weight:600}
   .del{height:26px;padding:0 8px;background:transparent;color:var(--sub);border:1px solid var(--line);
        border-radius:7px;font-size:13px;line-height:1}
   .del:hover{color:#c0392b;border-color:#e5b8b2}
@@ -232,6 +253,10 @@ PANEL_HTML = """<!doctype html>
   <div class="meta">权重 0 = 本轮不抽，数值越大越容易被抽中；改完点「保存修改」</div>
 </header>
 <main>
+  <div class="cfg">
+    <label>最近 <input id="cfg_draws" type="number" min="0" max="20" step="1" value="__HD__"> 次抽取不重复</label>
+    <label>每 <input id="cfg_round" type="number" min="1" max="1440" step="1" value="__RSM__"> 分钟清空窗口</label>
+  </div>
   <div class="addbar">
     <input id="newname" maxlength="12" placeholder="输入姓名，回车或点添加">
     <button id="addbtn">添加</button>
@@ -307,9 +332,13 @@ document.getElementById('newname').addEventListener('keydown',e=>{ if(e.key==='E
 document.getElementById('save').onclick=async ()=>{
   const weights=[...list.querySelectorAll('input')].map(i=>{
      let v=parseFloat(i.value); if(!isFinite(v)||v<0) v=0; if(v>100) v=100; return v; });
+  const cfgD=document.getElementById('cfg_draws');
+  const cfgR=document.getElementById('cfg_round');
+  let hd=parseInt(cfgD.value,10); if(!isFinite(hd)) hd=3; hd=Math.max(0,Math.min(20,hd));
+  let rm=parseInt(cfgR.value,10); if(!isFinite(rm)) rm=5; rm=Math.max(1,Math.min(1440,rm));
   const r=await fetch('/api/admin/save',{method:'POST',headers:{'Content-Type':'application/json','X-RC':'1'},
-     body:JSON.stringify({weights})});
-  if(r.ok){ showToast('已保存，客户端下次启动生效'); }
+     body:JSON.stringify({weights, hist_draws:hd, round_seconds:rm*60})});
+  if(r.ok){ showToast('已保存，客户端立刻生效'); }
   else { showToast('保存失败：'+r.status); }
 };
 
@@ -336,6 +365,8 @@ def admin_html(st):
     html = html.replace("__LAST__", last_s)
     html = html.replace("__NAMES__", json.dumps(names, ensure_ascii=False).replace("</", "<\\/"))
     html = html.replace("__WEIGHTS__", json.dumps([round(float(x), 2) for x in weights]))
+    html = html.replace("__HD__", str(int(st.get("hist_draws") or 0)))
+    html = html.replace("__RSM__", str(max(1, int(st.get("round_seconds") or 300) // 60)))
     return html
 
 
@@ -517,33 +548,61 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(403, {"ok": False, "error": "csrf"})
         try:
             payload = json.loads(self._body().decode("utf-8"))
-            weights = payload["weights"]
+            if not isinstance(payload, dict):
+                raise ValueError
         except (ValueError, KeyError):
             return self._json(400, {"ok": False, "error": "bad json"})
+
+        weights = payload.get("weights")
+        round_seconds = payload.get("round_seconds")
+        hist_draws = payload.get("hist_draws")
+
+        if weights is None and round_seconds is None and hist_draws is None:
+            return self._json(400, {"ok": False, "error": "nothing to save"})
 
         with _lock:
             st = state_read()
             n = len(st.get("names") or [])
-            if not isinstance(weights, list) or len(weights) != n:
-                return self._json(400, {"ok": False, "error": "weights length mismatch",
-                                        "expect": n, "got": len(weights) if isinstance(weights, list) else -1})
-            clean = []
-            for w in weights:
+
+            if weights is not None:
+                if not isinstance(weights, list) or len(weights) != n:
+                    return self._json(400, {"ok": False, "error": "weights length mismatch",
+                                            "expect": n, "got": len(weights) if isinstance(weights, list) else -1})
+                clean = []
+                for w in weights:
+                    try:
+                        v = float(w)
+                    except (TypeError, ValueError):
+                        v = 1.0
+                    if v < 0:
+                        v = 0.0
+                    if v > MAX_WEIGHT:
+                        v = MAX_WEIGHT
+                    clean.append(round(v, 2))
+                st["weights"] = clean
+
+            if round_seconds is not None:
                 try:
-                    v = float(w)
+                    st["round_seconds"] = max(10, min(86400, int(round_seconds)))
                 except (TypeError, ValueError):
-                    v = 1.0
-                if v < 0:
-                    v = 0.0
-                if v > MAX_WEIGHT:
-                    v = MAX_WEIGHT
-                clean.append(round(v, 2))
-            st["weights"] = clean
+                    return self._json(400, {"ok": False, "error": "bad round_seconds"})
+
+            if hist_draws is not None:
+                try:
+                    st["hist_draws"] = max(0, min(20, int(hist_draws)))
+                except (TypeError, ValueError):
+                    return self._json(400, {"ok": False, "error": "bad hist_draws"})
+
             st["updated"] = int(time.time())
             st["rev"] = int(st.get("rev") or 0) + 1
             state_write(st)
-        log_line("weights saved: %s" % (clean[:5],))
-        return self._json(200, {"ok": True, "updated": st["updated"]})
+
+        log_line("saved: weights=%s rs=%s hd=%s" % (
+            "yes" if weights is not None else "-",
+            st.get("round_seconds"), st.get("hist_draws")))
+        return self._json(200, {"ok": True, "updated": st["updated"],
+                                "round_seconds": st.get("round_seconds"),
+                                "hist_draws": st.get("hist_draws")})
 
     def rev(self, q):
         """只返回状态版本号（几十字节），给轮询兜底用；不写任何状态。"""
@@ -650,8 +709,10 @@ class Handler(BaseHTTPRequestHandler):
             st["sync_count"] = int(st.get("sync_count") or 0) + 1
             state_write(st)
 
-        body = "RC1\nv=%d\nw=%s\n" % (
+        body = "RC1\nv=%d\nrs=%d\nhd=%d\nw=%s\n" % (
             int(time.time()),
+            int(st.get("round_seconds") or 300),
+            int(st.get("hist_draws") or 0),
             ",".join("%.4g" % float(w) for w in (st.get("weights") or [])))
         if st.get("names"):
             body += "n=%s\n" % "|".join(st["names"])

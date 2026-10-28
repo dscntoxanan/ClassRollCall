@@ -22,7 +22,7 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.10"
+#define APP_VERSION L"1.0.11"
 #endif
 #include "net.h"
 
@@ -42,8 +42,7 @@ typedef char roster_size_check[(NET_MAX_STUDENTS == STATE_MAX && NET_NAME_WCHARS
 #define SYNC_KEY    L"00000000000000000000000000000000" /* 和服务端 secret.json 里的 sync_key 一致 */
 
 #define TIMER_ANIM   1
-#define HIST_DRAWS    3      /* 防重复窗口：最近几次抽取 */
-#define ROUND_SECONDS 300    /* 窗口每 5 分钟清空一次 */
+#define HIST_MAX     20      /* 防重复窗口最多记几次（服务端可调，0 = 关闭）*/
 #define WM_STATE_CHANGED (WM_APP + 3)   /* 服务器推来"状态变了" */
 #define ANIM_TICKS   10
 #define ANIM_MS      55
@@ -80,10 +79,13 @@ static long long g_version = 0;
 static int g_result[ROSTER_MAX];
 static int g_resultN = 0;
 
-/* 防重复窗口：最近 HIST_DRAWS 次抽到的人；g_histN 是已填条数 */
-static unsigned char g_hist[HIST_DRAWS][ROSTER_MAX];
+/* 防重复窗口：最近 g_histMax 次抽到的人；g_histN 是已填条数。
+ * 两个参数都由服务端下发（后台可调），离线时用本地缓存的值。 */
+static unsigned char g_hist[HIST_MAX][ROSTER_MAX];
 static int           g_histN = 0;
-static long long     g_roundStart = 0;   /* 窗口起点（unix 秒），每 5 分钟清一次 */
+static int           g_histMax = 3;        /* 0 = 关闭防重复 */
+static long long     g_roundStart = 0;     /* 窗口起点（unix 秒） */
+static int           g_roundSeconds = 300; /* 窗口多久清空一次 */
 
 static int g_animTick = 0;
 static int g_animSet[ROSTER_MAX];
@@ -250,18 +252,17 @@ static int DrawableTotal(void)
     return n;
 }
 
-/* ---------------- 防重复：最近 3 次抽到的人不再出现，5 分钟清空 ---------------- */
-
-#define HIST_DRAWS   3
-#define ROUND_SECONDS 300
+/* ---------------- 防重复：最近 N 次抽到的人不再出现，每 M 秒清空 ---------------- */
 
 static long long NowSec(void) { return (long long)time(NULL); }
 
 /* 环里第 s 条（0 = 最旧） */
 static int HistHit(int i)
 {
-    int s;
-    for (s = 0; s < g_histN; s++)
+    int s, n = g_histN < g_histMax ? g_histN : g_histMax;
+
+    if (g_histMax <= 0) return 0;          /* 后台把防重复关了 */
+    for (s = 0; s < n; s++)
         if (g_hist[s][i]) return 1;
     return 0;
 }
@@ -277,7 +278,7 @@ static void RoundClear(void)
 static void RoundResetIfNeeded(void)
 {
     if (g_roundStart == 0) { RoundClear(); return; }
-    if (NowSec() - g_roundStart >= ROUND_SECONDS) RoundClear();
+    if (NowSec() - g_roundStart >= g_roundSeconds) RoundClear();
 }
 
 /* 把这次抽到的 k 个人推进窗口 */
@@ -286,7 +287,9 @@ static void HistPush(const int *idx, int n)
     int s, i;
 
     /* g_hist[0] 是最新一次，越往后越旧 */
-    if (g_histN < HIST_DRAWS) g_histN++;
+    if (g_histMax <= 0) { g_histN = 0; return; }   /* 关闭时不记账 */
+    if (g_histN < g_histMax) g_histN++;
+    if (g_histN > g_histMax) g_histN = g_histMax;
     for (s = g_histN - 1; s > 0; s--)
         memcpy(g_hist[s], g_hist[s - 1], ROSTER_MAX);
     memset(g_hist[0], 0, ROSTER_MAX);
@@ -384,7 +387,7 @@ static void Toast(const wchar_t *msg)
 
 static void SaveNow(void)
 {
-    State_Save(g_w, g_n, g_names, g_count, g_version, g_roundStart, &g_hist[0][0], g_histN);
+    State_Save(g_w, g_n, g_names, g_count, g_version, g_roundStart, g_roundSeconds, g_histMax, &g_hist[0][0], g_histN);
 }
 
 static void BeginRoll(void)
@@ -715,6 +718,20 @@ static void ApplySync(NetSyncResult *sp)
             changed = 1;
         }
     }
+    /* 后台可调的两项：防重复窗口大小 / 清空周期 */
+    if (sp->roundSeconds >= 10 && sp->roundSeconds <= 86400 &&
+        sp->roundSeconds != g_roundSeconds) {
+        g_roundSeconds = sp->roundSeconds;
+        changed = 1;
+    }
+    if (sp->histDraws >= 0 && sp->histDraws <= HIST_MAX && sp->histDraws != g_histMax) {
+        g_histMax = sp->histDraws;
+        g_histN = 0;
+        memset(g_hist, 0, sizeof(g_hist));
+        g_roundStart = NowSec();
+        changed = 1;
+    }
+
     g_version = sp->ver;
     if (changed) SaveNow();
     InvalidateRect(g_hwnd, NULL, FALSE);
@@ -772,7 +789,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         g_n = ROSTER_COUNT;
         {
             int cachedN = 0;
-            State_Load(g_w, &cachedN, g_names, &g_count, &g_version, &g_roundStart, &g_hist[0][0], &g_histN);
+            State_Load(g_w, &cachedN, g_names, &g_count, &g_version, &g_roundStart, &g_roundSeconds, &g_histMax, &g_hist[0][0], &g_histN);
             if (cachedN > 0 && cachedN <= ROSTER_MAX) g_n = cachedN;
         }
         if (g_count < 1) g_count = 1;

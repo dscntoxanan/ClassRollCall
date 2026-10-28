@@ -31,7 +31,8 @@ static void BuildPath(wchar_t *buf, int cap)
 }
 
 void State_Load(double *w, int *n, wchar_t names[][STATE_NAME_WCHARS], int *count,
-                long long *ver, long long *roundStart, unsigned char *hist, int *histN)
+                long long *ver, long long *roundStart, int *roundSeconds, int *histMax,
+                unsigned char *hist, int *histN)
 {
     wchar_t path[MAX_PATH];
     char line[8192];
@@ -42,6 +43,8 @@ void State_Load(double *w, int *n, wchar_t names[][STATE_NAME_WCHARS], int *coun
     if (count) *count = 1;
     if (ver) *ver = 0;
     if (roundStart) *roundStart = 0;
+    if (roundSeconds) *roundSeconds = 300;
+    if (histMax) *histMax = 3;
     if (histN) *histN = 0;
     if (hist) memset(hist, 0, STATE_MAX * 3);
 
@@ -59,6 +62,10 @@ void State_Load(double *w, int *n, wchar_t names[][STATE_NAME_WCHARS], int *coun
             if (n) *n = v;
         } else if (strncmp(line, "r=", 2) == 0) {
             if (roundStart) *roundStart = _strtoi64(line + 2, NULL, 10);
+        } else if (strncmp(line, "rs=", 3) == 0) {
+            if (roundSeconds) *roundSeconds = atoi(line + 3);
+        } else if (strncmp(line, "hd=", 3) == 0) {
+            if (histMax) *histMax = atoi(line + 3);
         } else if (strncmp(line, "d", 1) == 0 && line[1] >= '0' && line[1] <= '2' && line[2] == '=' && hist) {
             int slot = line[1] - '0', i;
             unsigned char *dst = hist + (size_t)slot * STATE_MAX;
@@ -100,7 +107,8 @@ void State_Load(double *w, int *n, wchar_t names[][STATE_NAME_WCHARS], int *coun
 }
 
 void State_Save(const double *w, int n, wchar_t names[][STATE_NAME_WCHARS], int count,
-                long long ver, long long roundStart, const unsigned char *hist, int histN)
+                long long ver, long long roundStart, int roundSeconds, int histMax,
+                const unsigned char *hist, int histN)
 {
     wchar_t path[MAX_PATH];
     wchar_t tmp[MAX_PATH];
@@ -118,6 +126,8 @@ void State_Save(const double *w, int n, wchar_t names[][STATE_NAME_WCHARS], int 
     fprintf(f, "count=%d\n", count);
     fprintf(f, "ver=%lld\n", ver);
     fprintf(f, "r=%lld\n", roundStart);
+    fprintf(f, "rs=%d\n", roundSeconds);
+    fprintf(f, "hd=%d\n", histMax);
     fprintf(f, "n=%d\n", n);
     {
         int s;

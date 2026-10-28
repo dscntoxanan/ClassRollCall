@@ -145,6 +145,13 @@ static int ParseResponse(const char *resp, NetSyncResult *out)
 
     if (pv && pv < pw) out->ver = _strtoi64(pv + 3, NULL, 10);
 
+    {
+        const char *prs = strstr(resp, "\nrs=");
+        const char *phd = strstr(resp, "\nhd=");
+        if (prs) out->roundSeconds = (int)_strtoi64(prs + 4, NULL, 10);
+        if (phd) out->histDraws = (int)_strtoi64(phd + 4, NULL, 10);
+    }
+
     ParseWeights(pw + 3, out);
     if (pn) ParseNames(pn + 3, out);
 

@@ -12,6 +12,8 @@
 
 typedef struct {
     long long ver;
+    int roundSeconds;                            /* 防重复窗口多久清空（秒）；0 = 服务端没给 */
+    int histDraws;                               /* 最近几次不重复；0 = 关闭 */
     int wCount;
     double w[NET_MAX_STUDENTS];
     int nCount;                                  /* 0 表示服务器没下发名单 */
