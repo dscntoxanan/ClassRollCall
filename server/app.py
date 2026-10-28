@@ -279,7 +279,8 @@ PANEL_HTML = """<!doctype html>
 <header>
   <h1><span class="dot"></span>__CLASS__</h1>
   <div class="meta">名单 __COUNT__ 人 · 上次同步 __LAST__</div>
-  <div class="meta">权重 0 = 本轮不抽，数值越大越容易被抽中；改完点「保存修改」</div>
+  <div class="meta">权重 0 = 不参与常规抽取，数值越大越容易被抽中；改完点「保存修改」</div>
+  <div class="meta">被抽到的人 30 分钟内权重自动 −0.2（最低 1.0，本来 ≤1 的不变）；客户端重启即恢复</div>
 </header>
 <main>
   <div class="cfg">

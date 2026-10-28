@@ -102,6 +102,7 @@ void State_Load(StateData *sd, wchar_t names[][STATE_NAME_WCHARS], int *nameCoun
             if (sd->count < 1) sd->count = 1;
         } else if (strncmp(line, "ver=", 4) == 0) {
             sd->ver = _strtoi64(line + 4, NULL, 10);
+
         } else if (strncmp(line, "w=", 2) == 0) {
             char *p = line + 2;
             int i;
@@ -175,6 +176,7 @@ void State_Save(const StateData *sd, wchar_t names[][STATE_NAME_WCHARS])
         if (WideCharToMultiByte(CP_UTF8, 0, sd->nextName, -1, utf8, sizeof(utf8) - 1, NULL, NULL) > 1)
             fprintf(f, "nx=%s\n", utf8);
     }
+
 
 
     fputs("w=", f);

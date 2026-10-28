@@ -24,6 +24,7 @@ typedef struct {
     wchar_t       className[STATE_CLASS_WCHARS];
     wchar_t       nextName[STATE_NAME_WCHARS];
     unsigned char hist[STATE_HIST][STATE_MAX];
+
     int           histN;
 } StateData;
 

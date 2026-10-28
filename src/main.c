@@ -22,7 +22,7 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.13"
+#define APP_VERSION L"1.0.14"
 #endif
 #include "net.h"
 
@@ -44,6 +44,8 @@ typedef char roster_size_check[(NET_MAX_STUDENTS == STATE_MAX && NET_NAME_WCHARS
 #define TIMER_ANIM   1
 #define HIST_MAX     20      /* 防重复窗口最多记几次（服务端可调，0 = 关闭）*/
 #define MAX_PICK_ABS 20      /* 一次最多抽几人的硬上限 */
+#define PENALTY        0.2   /* 被抽到后权重临时下降多少 */
+#define PENALTY_SECONDS 1800 /* 下降持续多久（30 分钟） */
 #define WM_STATE_CHANGED (WM_APP + 3)   /* 服务器推来"状态变了" */
 #define ANIM_TICKS   10
 #define ANIM_MS      55
@@ -93,6 +95,9 @@ static int           g_maxPick = 5;        /* 一次最多抽几人 */
 static int           g_defaultCount = 1;   /* 新机器默认抽几人 */
 static int           g_fresh = 0;          /* 1 = 还没读过本地状态（首次运行） */
 static wchar_t       g_className[64] = CLASS_NAME;
+
+/* 伪随机：被抽到的人在一段时间内权重临时下降（最低 1.0） */
+static long long     g_penaltyUntil[ROSTER_MAX];
 
 /* 指定下一位：nextId 变了才算"新的一次指定" */
 static wchar_t       g_nextName[NAME_LEN] = L"";
@@ -268,9 +273,24 @@ static int DrawableTotal(void)
     return n;
 }
 
-/* ---------------- 防重复：最近 N 次抽到的人不再出现，每 M 秒清空 ---------------- */
+/* ---------------- 伪随机：抽到后临时降权 ---------------- */
 
 static long long NowSec(void) { return (long long)time(NULL); }
+
+/* 实际参与抽取的权重：被抽到过且还在惩罚期内，就 -0.2（不低于 1.0） */
+static double EffWeight(int i)
+{
+    double w = g_w[i];
+
+    if (w > 1.0 && g_penaltyUntil[i] > NowSec()) {
+        double r = w - PENALTY;
+        if (r < 1.0) r = 1.0;
+        return r;
+    }
+    return w;
+}
+
+/* ---------------- 防重复：最近 N 次抽到的人不再出现，每 M 秒清空 ---------------- */
 
 /* 环里第 s 条（0 = 最旧） */
 static int HistHit(int i)
@@ -344,7 +364,7 @@ static int PickSet(int *out, int k)
         int pick;
 
         for (i = 0; i < g_n; i++)
-            if (!taken[i] && g_w[i] > 0) { cand[m++] = i; total += g_w[i]; }
+            if (!taken[i] && g_w[i] > 0) { cand[m++] = i; total += EffWeight(i); }
 
         if (m == 0) {
             for (i = 0; i < g_n; i++)
@@ -358,7 +378,7 @@ static int PickSet(int *out, int k)
             g_histN = 0;
             for (i = 0; i < got; i++) taken[out[i]] = 1;
             for (i = 0; i < g_n; i++)
-                if (!taken[i] && g_w[i] > 0) { cand[m++] = i; total += g_w[i]; }
+                if (!taken[i] && g_w[i] > 0) { cand[m++] = i; total += EffWeight(i); }
             if (m == 0) {
                 for (i = 0; i < g_n; i++)
                     if (!taken[i]) cand[m++] = i;
@@ -371,7 +391,7 @@ static int PickSet(int *out, int k)
             r = ((double)rand() / ((double)RAND_MAX + 1.0)) * total;
             pick = cand[m - 1];
             for (i = 0; i < m; i++) {
-                r -= g_w[cand[i]];
+                r -= EffWeight(cand[i]);
                 if (r <= 0.0) { pick = cand[i]; break; }
             }
         } else {
@@ -382,7 +402,13 @@ static int PickSet(int *out, int k)
         out[got++] = pick;
     }
 
-    if (got > 0) HistPush(out, got);
+    if (got > 0) {
+        long long until = NowSec() + PENALTY_SECONDS;
+
+        HistPush(out, got);
+        for (i = 0; i < got; i++) g_penaltyUntil[out[i]] = until;   /* 伪随机：降权 30 分钟 */
+
+    }
     return got;
 }
 /* 动画用：从全体里均匀挑 k 个不重复的（不看权重） */
@@ -433,6 +459,7 @@ static void SaveNow(void)
     sd.histN = g_histN;
     memcpy(sd.w, g_w, sizeof(double) * (g_n > 0 ? g_n : 0));
     memcpy(sd.hist, g_hist, sizeof(g_hist));
+
     lstrcpynW(sd.className, g_className, STATE_CLASS_WCHARS);
     lstrcpynW(sd.nextName, g_nextName, STATE_NAME_WCHARS);
 
@@ -894,6 +921,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             /* 防重复窗口只在本次运行内有效：重启就清空，不从磁盘恢复 */
             memset(g_hist, 0, sizeof(g_hist));
             g_histN = 0;
+            /* 伪随机降权也只在本次运行内有效：重启立刻恢复服务器下发的权重 */
+            memset(g_penaltyUntil, 0, sizeof(g_penaltyUntil));
         }
         if (g_count < 1) g_count = 1;
         if (g_count > PickLimit()) g_count = PickLimit();
