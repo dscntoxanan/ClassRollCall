@@ -22,7 +22,7 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.12"
+#define APP_VERSION L"1.0.13"
 #endif
 #include "net.h"
 
@@ -891,8 +891,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_nextUsed = sd.nextUsed;
             if (sd.className[0]) lstrcpynW(g_className, sd.className, STATE_CLASS_WCHARS);
             lstrcpynW(g_nextName, sd.nextName, STATE_NAME_WCHARS);
-            memcpy(g_hist, sd.hist, sizeof(g_hist));
-            g_histN = sd.histN;
+            /* 防重复窗口只在本次运行内有效：重启就清空，不从磁盘恢复 */
+            memset(g_hist, 0, sizeof(g_hist));
+            g_histN = 0;
         }
         if (g_count < 1) g_count = 1;
         if (g_count > PickLimit()) g_count = PickLimit();

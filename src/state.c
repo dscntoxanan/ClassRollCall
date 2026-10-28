@@ -139,14 +139,13 @@ void State_Save(const StateData *sd, wchar_t names[][STATE_NAME_WCHARS])
     wchar_t path[MAX_PATH];
     wchar_t tmp[MAX_PATH];
     FILE *f;
-    int i, n, histN;
+    int i, n;
 
     if (!sd) return;
     n = sd->n;
     if (n < 0) n = 0;
     if (n > STATE_MAX) n = STATE_MAX;
-    histN = sd->histN;
-    if (histN > STATE_HIST) histN = STATE_HIST;
+
 
     BuildPath(path);
     wsprintfW(tmp, L"%s.tmp", path);
@@ -177,15 +176,6 @@ void State_Save(const StateData *sd, wchar_t names[][STATE_NAME_WCHARS])
             fprintf(f, "nx=%s\n", utf8);
     }
 
-    {
-        int s;
-        for (s = 0; s < STATE_HIST; s++) {
-            fprintf(f, "d%02d=", s);
-            for (i = 0; i < n; i++)
-                fputc(s < histN ? (sd->hist[s][i] ? '1' : '0') : '0', f);
-            fputc('\n', f);
-        }
-    }
 
     fputs("w=", f);
     for (i = 0; i < n; i++) {
