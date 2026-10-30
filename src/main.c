@@ -22,7 +22,7 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.14"
+#define APP_VERSION L"1.0.15"
 #endif
 #include "net.h"
 
@@ -98,6 +98,9 @@ static wchar_t       g_className[64] = CLASS_NAME;
 
 /* 伪随机：被抽到的人在一段时间内权重临时下降（最低 1.0） */
 static long long     g_penaltyUntil[ROSTER_MAX];
+
+/* 本轮是否已经出过"权重 0"的人：每轮最多一个 */
+static int g_zeroUsed = 0;
 
 /* 指定下一位：nextId 变了才算"新的一次指定" */
 static wchar_t       g_nextName[NAME_LEN] = L"";
@@ -306,6 +309,7 @@ static int HistHit(int i)
 static void RoundClear(void)
 {
     memset(g_hist, 0, sizeof(g_hist));
+    g_zeroUsed = 0;
     g_histN = 0;
     g_roundStart = NowSec();
 }
@@ -355,6 +359,10 @@ static int PickSet(int *out, int k)
         if (fi >= 0) {
             taken[fi] = 1;
             out[got++] = fi;
+            if (g_w[fi] <= 0) {
+                g_zeroUsed = 1;
+                RoundClear();           /* 指定的是 0 权重的人：本轮也就结束了 */
+            }
         }
     }
 
@@ -367,15 +375,17 @@ static int PickSet(int *out, int k)
             if (!taken[i] && g_w[i] > 0) { cand[m++] = i; total += EffWeight(i); }
 
         if (m == 0) {
-            for (i = 0; i < g_n; i++)
-                if (!taken[i] && g_w[i] <= 0) cand[m++] = i;
+            /* 权重 0 的人：本轮最多出一个，出过了就整体跳过 */
+            if (!g_zeroUsed) {
+                for (i = 0; i < g_n; i++)
+                    if (!taken[i] && g_w[i] <= 0) cand[m++] = i;
+            }
             total = 0.0;   /* 0 权重的人按均匀抽 */
         }
 
         if (m == 0) {
-            /* 最近 3 次的都排除了还是没人：清空窗口，但别把本次已抽到的又抽一遍 */
-            memset(g_hist, 0, sizeof(g_hist));
-            g_histN = 0;
+            /* 本轮真没人可抽了：开新一轮（清窗口 + 清 0 标记）再试一次 */
+            RoundClear();
             for (i = 0; i < got; i++) taken[out[i]] = 1;
             for (i = 0; i < g_n; i++)
                 if (!taken[i] && g_w[i] > 0) { cand[m++] = i; total += EffWeight(i); }
@@ -400,6 +410,12 @@ static int PickSet(int *out, int k)
 
         taken[pick] = 1;
         out[got++] = pick;
+
+        if (g_w[pick] <= 0) {
+            /* 抽到权重 0 的人：本轮到此为止，剩下的名额从新一轮里抽 */
+            g_zeroUsed = 1;
+            RoundClear();
+        }
     }
 
     if (got > 0) {
@@ -407,7 +423,6 @@ static int PickSet(int *out, int k)
 
         HistPush(out, got);
         for (i = 0; i < got; i++) g_penaltyUntil[out[i]] = until;   /* 伪随机：降权 30 分钟 */
-
     }
     return got;
 }
