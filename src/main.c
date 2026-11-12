@@ -23,9 +23,10 @@
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.17"
+#define APP_VERSION L"1.0.23"
 #endif
 #include "net.h"
+
 
 /* 名单容量以网络层/状态层的定义为准，避免三处写死不一致 */
 /* 单次最多抽几个人 */
@@ -61,7 +62,7 @@ typedef char roster_size_check[(NET_MAX_STUDENTS == STATE_MAX && NET_NAME_WCHARS
 #define C_AMBER     RGB(196, 132, 8)
 
 typedef struct {
-    RECT rcTitle, rcMinus, rcPlus, rcBtn, rcResult;
+    RECT rcTitle, rcMinus, rcPlus, rcBtn, rcResult, rcChev, rcMenu;
     int m;
 } Layout;
 
@@ -78,6 +79,23 @@ static int       g_n = 0;
 static double    g_w[ROSTER_MAX];
 static int       g_count = 1;        /* 每次抽几个人 */
 static long long g_version = 0;
+/* 1 = 这台机器的名单曾由服务器下发过。此后 exe 里那份出厂名单永久失效，
+ * 免得换新版 exe 时把班里已经在用的名单"改回"编译那一刻的样子。 */
+static int       g_seeded = 0;
+static int       g_rosterRev = 0;              /* 本地名单对应的名单版本号 */
+static char      g_rosterMd5[33] = { 0 };      /* 本地名单 md5（发现被改过就用服务器的恢复） */
+
+/* 科目：后台导入成绩后按"离满分的差距"算出来的权重，一科一套。
+ * g_subSel = -1 表示用正常权重（后台手动设的概率），否则是下面的下标。 */
+static int    g_subCount = 0;
+static wchar_t g_subName[NET_MAX_SUBJECTS][NET_SUBJECT_WCHARS];
+static int    g_subOn[NET_MAX_SUBJECTS];
+static int    g_subWCount[NET_MAX_SUBJECTS];
+static double g_subW[NET_MAX_SUBJECTS][ROSTER_MAX];
+static int    g_subSel = -1;
+static wchar_t g_subWant[NET_NAME_WCHARS];   /* 记住选中的科目名，同步后按名字找回 */
+static int    g_menuOpen = 0;
+static int    g_hoverChev = 0, g_hoverItem = -1;
 
 static int g_result[ROSTER_MAX];
 static int g_resultN = 0;
@@ -225,7 +243,66 @@ static void TextRect(HDC dc, HFONT f, COLORREF color, const wchar_t *t, RECT r, 
     DrawTextW(dc, t, -1, &r, flags | DT_NOPREFIX);    SelectObject(dc, old);
 }
 
+/* 科目提示符：一个指向下的 "^"旋转体（大于号竖过来的样子），展开后指向上 */
+static void DrawChevron(HDC dc, const RECT *r, int up, COLORREF color)
+{
+    int cx = (r->left + r->right) / 2;
+    int cy = (r->top + r->bottom) / 2;
+    int w = S(5), h = S(3);
+    HPEN pen = CreatePen(PS_SOLID, S(2) > 1 ? S(2) : 1, color);
+    HGDIOBJ old = SelectObject(dc, pen);
+
+    if (w < 3) w = 3;
+    if (h < 2) h = 2;
+    MoveToEx(dc, cx - w, up ? cy + h : cy - h, NULL);
+    LineTo(dc, cx, up ? cy - h : cy + h);
+    LineTo(dc, cx + w, up ? cy + h : cy - h);
+
+    SelectObject(dc, old);
+    DeleteObject(pen);
+}
+
+/* 卡片：白底 + 1px 边 */
+static void Card(HDC dc, const RECT *r, int radius)
+{
+    HBRUSH br = CreateSolidBrush(RGB(255, 255, 255));
+    HPEN   pen = CreatePen(PS_SOLID, 1, C_LINE);
+    HGDIOBJ ob = SelectObject(dc, br);
+    HGDIOBJ op = SelectObject(dc, pen);
+    RoundRect(dc, r->left, r->top, r->right, r->bottom, radius * 2, radius * 2);
+    SelectObject(dc, ob);
+    SelectObject(dc, op);
+    DeleteObject(br);
+    DeleteObject(pen);
+}
+
 /* ---------------- 布局 ---------------- */
+
+/* 菜单里有多少项：1（正常权重）+ 有数据且启用的科目 */
+static int SubMenuCount(void)
+{
+    int i, n = 1;
+
+    for (i = 0; i < g_subCount; i++)
+        if (g_subOn[i] && g_subWCount[i] > 0) n++;
+    return n;
+}
+
+/* 菜单第 idx 项对应的科目下标；idx=0 是"正常权重"（返回 -1） */
+static int SubAt(int idx)
+{
+    int i, k = 1;
+
+    if (idx <= 0) return -1;
+    for (i = 0; i < g_subCount; i++) {
+        if (!g_subOn[i] || g_subWCount[i] <= 0) continue;
+        if (k == idx) return i;
+        k++;
+    }
+    return -1;
+}
+
+static int MenuRowH(void) { return S(30); }
 
 static void ComputeLayout(const RECT *rc, Layout *L)
 {
@@ -264,15 +341,35 @@ static void ComputeLayout(const RECT *rc, Layout *L)
     L->rcResult.right = rc->right - m;
     L->rcResult.top = m + S(42);
     L->rcResult.bottom = rowTop - S(30);
+
+    /* 左上角班级名下方的小提示符 */
+    L->rcChev.left = m - S(2);
+    L->rcChev.right = L->rcChev.left + S(24);
+    L->rcChev.top = L->rcTitle.bottom - S(2);
+    L->rcChev.bottom = L->rcChev.top + S(22);
+
+    /* 展开的科目菜单：贴着提示符往下 */
+    L->rcMenu.left = m - S(6);
+    L->rcMenu.right = L->rcMenu.left + S(150);
+    L->rcMenu.top = L->rcChev.bottom - S(2);
+    L->rcMenu.bottom = L->rcMenu.top + S(6) + SubMenuCount() * MenuRowH() + S(6);
 }
 
 /* ---------------- 抽签 ---------------- */
+
+/* 当前生效的权重：选了科目就用那一科，否则用后台设的正常权重 */
+static double BaseW(int i)
+{
+    if (g_subSel >= 0 && g_subSel < g_subCount && g_subOn[g_subSel] && i < g_subWCount[g_subSel])
+        return g_subW[g_subSel][i];
+    return g_w[i];
+}
 
 static int DrawableTotal(void)
 {
     int i, n = 0;
     for (i = 0; i < g_n; i++)
-        if (g_w[i] > 0) n++;
+        if (BaseW(i) > 0) n++;
     return n;
 }
 
@@ -280,12 +377,13 @@ static int DrawableTotal(void)
 
 static long long NowSec(void) { return (long long)time(NULL); }
 
-/* 实际参与抽取的权重：被抽到过且还在惩罚期内，就 -0.2（不低于 1.0） */
+/* 实际参与抽取的权重：被抽到过且还在惩罚期内，就 -0.2（不低于 1.0）。
+ * 科目模式下不降权：那套权重是按成绩算出来的，再削就没意义了。 */
 static double EffWeight(int i)
 {
-    double w = g_w[i];
+    double w = BaseW(i);
 
-    if (w > 1.0 && g_penaltyUntil[i] > NowSec()) {
+    if (g_subSel < 0 && w > 1.0 && g_penaltyUntil[i] > NowSec()) {
         double r = w - PENALTY;
         if (r < 1.0) r = 1.0;
         return r;
@@ -359,7 +457,7 @@ static int PickSet(int *out, int k)
         if (fi >= 0) {
             taken[fi] = 1;
             out[got++] = fi;
-            if (g_w[fi] <= 0) {
+            if (BaseW(fi) <= 0) {
                 g_zeroUsed = 1;
                 RoundClear();           /* 指定的是 0 权重的人：本轮也就结束了 */
             }
@@ -372,13 +470,13 @@ static int PickSet(int *out, int k)
         int pick;
 
         for (i = 0; i < g_n; i++)
-            if (!taken[i] && g_w[i] > 0) { cand[m++] = i; total += EffWeight(i); }
+            if (!taken[i] && BaseW(i) > 0) { cand[m++] = i; total += EffWeight(i); }
 
         if (m == 0) {
             /* 权重 0 的人：本轮最多出一个，出过了就整体跳过 */
             if (!g_zeroUsed) {
                 for (i = 0; i < g_n; i++)
-                    if (!taken[i] && g_w[i] <= 0) cand[m++] = i;
+                    if (!taken[i] && BaseW(i) <= 0) cand[m++] = i;
             }
             total = 0.0;   /* 0 权重的人按均匀抽 */
         }
@@ -388,7 +486,7 @@ static int PickSet(int *out, int k)
             RoundClear();
             for (i = 0; i < got; i++) taken[out[i]] = 1;
             for (i = 0; i < g_n; i++)
-                if (!taken[i] && g_w[i] > 0) { cand[m++] = i; total += EffWeight(i); }
+                if (!taken[i] && BaseW(i) > 0) { cand[m++] = i; total += EffWeight(i); }
             if (m == 0) {
                 for (i = 0; i < g_n; i++)
                     if (!taken[i]) cand[m++] = i;
@@ -411,7 +509,7 @@ static int PickSet(int *out, int k)
         taken[pick] = 1;
         out[got++] = pick;
 
-        if (g_w[pick] <= 0) {
+        if (BaseW(pick) <= 0) {
             /* 抽到权重 0 的人：本轮到此为止，剩下的名额从新一轮里抽 */
             g_zeroUsed = 1;
             RoundClear();
@@ -472,11 +570,15 @@ static void SaveNow(void)
     sd.nextId = g_nextId;
     sd.nextUsed = g_nextUsed;
     sd.histN = g_histN;
+    sd.seeded = g_seeded;
+    sd.rosterRev = g_rosterRev;
+    lstrcpynA(sd.rosterMd5, g_rosterMd5, (int)sizeof(sd.rosterMd5));
     memcpy(sd.w, g_w, sizeof(double) * (g_n > 0 ? g_n : 0));
     memcpy(sd.hist, g_hist, sizeof(g_hist));
 
     lstrcpynW(sd.className, g_className, STATE_CLASS_WCHARS);
     lstrcpynW(sd.nextName, g_nextName, STATE_NAME_WCHARS);
+    lstrcpynW(sd.subName, g_subWant, STATE_NAME_WCHARS);
 
     State_Save(&sd, g_names);
 }
@@ -487,9 +589,16 @@ static void BeginRoll(void)
 
     if (g_animTick > 0) return;
 
+    if (g_menuOpen) { g_menuOpen = 0; InvalidateRect(g_hwnd, NULL, FALSE); }
+
     RoundResetIfNeeded();   /* 跨分钟先开新一轮 */
 
     avail = DrawableTotal();
+    if (g_n <= 0) {
+        Toast(L"本地名单为空，请检查配置文件");
+        InvalidateRect(g_hwnd, NULL, FALSE);
+        return;
+    }
     if (avail <= 0) {
         Toast(L"没有可选的人：请到后台把概率调大于 0");
         InvalidateRect(g_hwnd, NULL, FALSE);
@@ -717,21 +826,24 @@ static void DrawScene(HDC dc, const RECT *rc)
     } else {
         RECT one = L.rcResult;
         RECT meta;
-        TextRect(dc, g_fName, C_TEXT, L"准备就绪", one, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        /* 本地还没有名单：不显示"共 0 人"，只给一句中性提示 */
+        TextRect(dc, g_fName, C_TEXT, g_n > 0 ? L"准备就绪" : L"暂无名单",
+                 one, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
         meta = one;
         meta.top = (one.top + one.bottom) / 2 + S(40);
         meta.bottom = meta.top + S(20);
         {
             wchar_t m2[64];
-            wsprintfW(m2, L"共 %d 人 · 每次抽 %d 人", g_n, g_count);
+            if (g_n > 0) wsprintfW(m2, L"共 %d 人 · 每次抽 %d 人", g_n, g_count);
+            else         lstrcpynW(m2, L"名单只从本机配置文件读取", 64);
             TextRect(dc, g_fSub, C_SUB, m2, meta, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
         }
     }
 
     /* 步进按钮 */
     {
-        int canMinus = g_count > 1;
-        int canPlus = g_count < PickLimit();
+        int canMinus = g_n > 0 && g_count > 1;
+        int canPlus = g_n > 0 && g_count < PickLimit();
 
         StrokeCircle(dc, &L.rcMinus, g_hoverMinus && canMinus ? RGB(243, 242, 237) : RGB(255, 255, 255),
                      g_hoverMinus && canMinus ? RGB(200, 198, 190) : C_LINE);
@@ -742,12 +854,15 @@ static void DrawScene(HDC dc, const RECT *rc)
         DrawStepGlyph(dc, &L.rcPlus, 1, canPlus ? C_TEXT : RGB(196, 194, 188));
     }
 
-    /* 主按钮 */
+    /* 主按钮（本地没有名单时显示"无名单"，点了也不会抽） */
     {
-        COLORREF bg = g_hoverBtn ? C_BTN_HOVER : C_BTN;
+        int ready = g_n > 0;
+        COLORREF bg = !ready ? RGB(198, 196, 190)
+                             : (g_hoverBtn ? C_BTN_HOVER : C_BTN);
         RECT rb = L.rcBtn;
-        if (g_pressed) { rb.top += S(1); rb.bottom += S(1); }
-        wsprintfW(label, L"抽 %d 位", g_count);
+        if (g_pressed && ready) { rb.top += S(1); rb.bottom += S(1); }
+        if (ready) wsprintfW(label, L"抽 %d 位", g_count);
+        else       lstrcpynW(label, L"无名单", 32);
         FillRound(dc, &rb, S(12), bg);
         TextRect(dc, g_fBtn, RGB(255, 255, 255), label, rb,
                  DT_SINGLELINE | DT_VCENTER | DT_CENTER);
@@ -760,6 +875,37 @@ static void DrawScene(HDC dc, const RECT *rc)
         r.top = L.rcBtn.top - S(30);
         r.bottom = r.top + S(20);
         TextRect(dc, g_fSub, C_AMBER, g_toast, r, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+    }
+
+    /* 科目提示符：没有任何科目成绩时完全不画（用户要求） */
+    if (SubMenuCount() > 1) {
+        DrawChevron(dc, &L.rcChev, g_menuOpen, g_hoverChev ? C_TEXT : RGB(176, 174, 168));
+    }
+
+    /* 展开的科目菜单（画在最上层） */
+    if (g_menuOpen && SubMenuCount() > 1) {
+        int i, n = SubMenuCount();
+        int rowH = MenuRowH();
+
+        Card(dc, &L.rcMenu, S(10));
+        for (i = 0; i < n; i++) {
+            RECT it;
+            int sub = SubAt(i);
+            int on = (sub < 0) ? (g_subSel < 0) : (g_subSel == sub);
+            COLORREF fg = on ? C_TEXT : C_SUB;
+
+            it.left = L.rcMenu.left + S(4);
+            it.right = L.rcMenu.right - S(4);
+            it.top = L.rcMenu.top + S(6) + i * rowH;
+            it.bottom = it.top + rowH;
+
+            if (on) FillRound(dc, &it, S(6), RGB(240, 239, 234));
+            else if (g_hoverItem == i) FillRound(dc, &it, S(6), RGB(248, 247, 244));
+
+            it.left += S(10);
+            TextRect(dc, g_fSub, fg, sub < 0 ? L"正常权重" : g_subName[sub], it,
+                     DT_SINGLELINE | DT_VCENTER | DT_LEFT);
+        }
     }
 }
 
@@ -793,19 +939,11 @@ static void ApplySync(NetSyncResult *sp)
 {
     int i, changed = 0;
 
-    /* 只有 Net_Sync 成功时才会走到这里，所以直接套用。
-     * 服务器下发了名单就以它为准（后台加人后客户端重启/F5 就能看到）；
-     * 没下发（nCount==0）就只更新权重，名单仍用本机缓存的。 */
-    if (sp->nCount > 0) {
-        int n = sp->nCount > ROSTER_MAX ? ROSTER_MAX : sp->nCount;
-        for (i = 0; i < n; i++) {
-            lstrcpynW(g_names[i], sp->names[i], NAME_LEN);
-            if (i >= sp->wCount) g_w[i] = 1.0;
-        }
-        g_n = n;
-        if (g_count > PickLimit()) g_count = PickLimit();
-        changed = 1;
-    }
+    /* 名单只认本机配置文件：服务器下发的 n= 一律不用（只在日志里能看出来）。
+       这里既不改 g_names 也不改 g_n，所以不会出现"名单被服务器改掉"的情况。 */
+    (void)sp->nCount;
+    (void)sp->rosterRev;
+    (void)sp->rosterMd5;
     for (i = 0; i < sp->wCount && i < g_n; i++) {
         if (sp->w[i] >= 0 && fabs(sp->w[i] - g_w[i]) > 1e-6) {
             g_w[i] = sp->w[i];
@@ -853,6 +991,32 @@ static void ApplySync(NetSyncResult *sp)
     }
 
     g_version = sp->ver;
+
+    /* 科目权重（后台按成绩算出来的）：整份替换，再按名字把上次选中的科目找回来 */
+    {
+        int n = sp->subCount > NET_MAX_SUBJECTS ? NET_MAX_SUBJECTS : sp->subCount;
+
+        /* 权重个数必须与人数一致，对不上的整科丢掉（协议约定，防止拿错表打分） */
+        g_subCount = 0;
+        for (i = 0; i < n; i++) {
+            int j, d, wc;
+
+            if (!sp->sub[i].name[0] || sp->sub[i].wCount != g_n) continue;
+            d = g_subCount++;
+            wc = g_n > ROSTER_MAX ? ROSTER_MAX : g_n;
+            lstrcpynW(g_subName[d], sp->sub[i].name, NET_SUBJECT_WCHARS);
+            g_subOn[d] = sp->sub[i].enabled;
+            g_subWCount[d] = wc;
+            for (j = 0; j < wc; j++) g_subW[d][j] = sp->sub[i].w[j];
+        }
+        g_subSel = -1;
+        if (g_subWant[0]) {
+            for (i = 0; i < g_subCount; i++)
+                if (g_subOn[i] && lstrcmpW(g_subName[i], g_subWant) == 0) { g_subSel = i; break; }
+            if (g_subSel < 0) g_subWant[0] = 0;   /* 这科没了/停用了：回到正常权重 */
+        }
+    }
+
     if (changed) SaveNow();
     InvalidateRect(g_hwnd, NULL, FALSE);
 }
@@ -860,9 +1024,9 @@ static void ApplySync(NetSyncResult *sp)
 static void UpdateHover(HWND hwnd, int x, int y)
 {
     Layout L;
-    RECT rc;
+    RECT rc, rh;
     POINT p;
-    int b, mi, pl;
+    int b, mi, pl, cv, item = -1;
 
     GetClientRect(hwnd, &rc);
     ComputeLayout(&rc, &L);
@@ -872,10 +1036,29 @@ static void UpdateHover(HWND hwnd, int x, int y)
     mi = PtInRect(&L.rcMinus, p) != 0;
     pl = PtInRect(&L.rcPlus, p) != 0;
 
-    if (b != g_hoverBtn || mi != g_hoverMinus || pl != g_hoverPlus) {
+    rh = L.rcChev;
+    InflateRect(&rh, S(4), S(4));
+    cv = (SubMenuCount() > 1) && PtInRect(&rh, p) != 0;
+
+    if (g_menuOpen && SubMenuCount() > 1) {
+        int i, n = SubMenuCount(), rowH = MenuRowH();
+        for (i = 0; i < n; i++) {
+            RECT it;
+            it.left = L.rcMenu.left + S(4);
+            it.right = L.rcMenu.right - S(4);
+            it.top = L.rcMenu.top + S(6) + i * rowH;
+            it.bottom = it.top + rowH;
+            if (PtInRect(&it, p)) { item = i; break; }
+        }
+    }
+
+    if (b != g_hoverBtn || mi != g_hoverMinus || pl != g_hoverPlus ||
+        cv != g_hoverChev || item != g_hoverItem) {
         g_hoverBtn = b;
         g_hoverMinus = mi;
         g_hoverPlus = pl;
+        g_hoverChev = cv;
+        g_hoverItem = item;
         InvalidateRect(hwnd, NULL, FALSE);
     }
 }
@@ -901,26 +1084,35 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
         srand((unsigned)(GetTickCount() ^ (DWORD)GetCurrentProcessId() ^ (unsigned)time(NULL)));
 
-        /* 先用编译进 exe 的名单兜底，再用本机缓存覆盖（缓存里有上次同步到的服务器名单） */
-        for (i = 0; i < ROSTER_COUNT; i++) {
-            lstrcpynW(g_names[i], kRosterNames[i], NAME_LEN);
-            g_w[i] = (i < ROSTER_COUNT) ? kRosterWeights[i] : 1.0;
-        }
-        g_n = ROSTER_COUNT;
+        /* 名单只认本机配置文件（%APPDATA%\XananRollCall\state.dat）：
+         *   - 有配置 → 就用配置里的名单，服务器不再下发、也不会改名单；
+         *   - 没配置 → 用编译进 exe 的出厂名单写一份配置出来。
+         * 这样换新版 exe 永远不会动到班里已经在用的名单。 */
         g_fresh = State_Exists() ? 0 : 1;
         {
             static StateData sd;
+            static wchar_t cached[ROSTER_MAX][STATE_NAME_WCHARS];
             int cachedN = 0;
 
             memset(&sd, 0, sizeof(sd));
-            State_Load(&sd, g_names, &cachedN);
+            State_Load(&sd, cached, &cachedN);
 
             if (cachedN > 0 && cachedN <= ROSTER_MAX) {
+                for (i = 0; i < cachedN; i++)
+                    lstrcpynW(g_names[i], cached[i], NAME_LEN);
                 g_n = cachedN;
                 if (sd.haveWeights) {
                     for (i = 0; i < g_n && i < STATE_MAX; i++)
                         if (sd.w[i] >= 0) g_w[i] = sd.w[i];
                 }
+            } else {
+                /* 没有配置文件（或文件里没有名单）：把出厂名单落成配置文件 */
+                for (i = 0; i < ROSTER_COUNT; i++) {
+                    lstrcpynW(g_names[i], kRosterNames[i], NAME_LEN);
+                    g_w[i] = kRosterWeights[i];
+                }
+                g_n = ROSTER_COUNT;
+                g_seeded = 1;
             }
             if (sd.count >= 1) g_count = sd.count;
             g_version = sd.ver;
@@ -933,6 +1125,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             g_nextUsed = sd.nextUsed;
             if (sd.className[0]) lstrcpynW(g_className, sd.className, STATE_CLASS_WCHARS);
             lstrcpynW(g_nextName, sd.nextName, STATE_NAME_WCHARS);
+            lstrcpynW(g_subWant, sd.subName, NET_NAME_WCHARS);   /* 上次选的科目，同步后按名字找回 */
+            g_rosterRev = sd.rosterRev;
+            lstrcpynA(g_rosterMd5, sd.rosterMd5, (int)sizeof(g_rosterMd5));
             /* 防重复窗口只在本次运行内有效：重启就清空，不从磁盘恢复 */
             memset(g_hist, 0, sizeof(g_hist));
             g_histN = 0;
@@ -941,6 +1136,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         if (g_count < 1) g_count = 1;
         if (g_count > PickLimit()) g_count = PickLimit();
+
+        /* 首次启动（或配置文件里没有名单）：把名单立刻落成配置文件，
+         * 之后只读这份文件，换新版 exe 也不会改动名单。 */
+        if (g_fresh || g_seeded) SaveNow();
 
         RoundResetIfNeeded();   /* 窗口过期就清掉 */
 
@@ -1010,7 +1209,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_LBUTTONDOWN: {
         Layout L;
-        RECT rc, rm, rp;
+        RECT rc, rm, rp, rh;
         POINT p;
         GetClientRect(hwnd, &rc);
         ComputeLayout(&rc, &L);
@@ -1022,6 +1221,43 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         rp = L.rcPlus;
         InflateRect(&rm, S(5), S(5));
         InflateRect(&rp, S(5), S(5));
+
+        /* 科目菜单开着的时候优先处理它 */
+        if (g_menuOpen && SubMenuCount() > 1) {
+            int i, n = SubMenuCount(), rowH = MenuRowH();
+
+            for (i = 0; i < n; i++) {
+                RECT it;
+                it.left = L.rcMenu.left + S(4);
+                it.right = L.rcMenu.right - S(4);
+                it.top = L.rcMenu.top + S(6) + i * rowH;
+                it.bottom = it.top + rowH;
+                if (PtInRect(&it, p)) {
+                    int sub = SubAt(i);
+                    g_subSel = sub;
+                    if (sub >= 0) lstrcpynW(g_subWant, g_subName[sub], NET_NAME_WCHARS);
+                    else g_subWant[0] = 0;
+                    g_menuOpen = 0;
+                    g_hoverItem = -1;
+                    SaveNow();
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    return 0;
+                }
+            }
+            /* 点别处：先收起菜单，再按普通点击继续处理 */
+            g_menuOpen = 0;
+            g_hoverItem = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
+
+        rh = L.rcChev;
+        InflateRect(&rh, S(4), S(4));
+        if (SubMenuCount() > 1 && PtInRect(&rh, p)) {
+            g_menuOpen = !g_menuOpen;
+            g_hoverItem = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+            return 0;
+        }
 
         if (PtInRect(&rm, p)) {
             SetCount(g_count - 1);
@@ -1064,7 +1300,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (wp == VK_UP || wp == VK_ADD || wp == VK_RIGHT) { SetCount(g_count + 1); return 0; }
         if (wp == VK_DOWN || wp == VK_SUBTRACT || wp == VK_LEFT) { SetCount(g_count - 1); return 0; }
         if (wp == VK_F5) { KickSync(hwnd); return 0; }
-        if (wp == VK_ESCAPE) { PostMessageW(hwnd, WM_CLOSE, 0, 0); return 0; }
+        if (wp == VK_ESCAPE) {
+            if (g_menuOpen) {           /* 菜单开着时 Esc 只收菜单，不退出 */
+                g_menuOpen = 0;
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            return 0;
+        }
         break;
 
     case WM_SYNC_DONE: {

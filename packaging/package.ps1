@@ -41,6 +41,9 @@ foreach ($b in @('install-cert.bat', 'uninstall-cert.bat')) {
 $txt = [System.IO.File]::ReadAllText((Join-Path $root 'packaging\README.txt'), [System.Text.Encoding]::UTF8)
 [System.IO.File]::WriteAllText((Join-Path $rel 'README.txt'), (ToCrlf $txt), (New-Object System.Text.UTF8Encoding($true)))
 
+# Version comes from the built exe's own resource, so SHA256.txt never lies again
+$verInfo = (Get-Item (Join-Path $rel 'ClassRollCall.exe')).VersionInfo
+$Version = '{0}.{1}.{2}' -f $verInfo.FileMajorPart, $verInfo.FileMinorPart, $verInfo.FileBuildPart
 $hash  = (Get-FileHash (Join-Path $rel 'ClassRollCall.exe') -Algorithm SHA256).Hash
 $thumb = (Get-PfxCertificate $cer).Thumbprint
 $built = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'

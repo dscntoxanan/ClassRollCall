@@ -6,7 +6,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const raw = readFileSync(join(root, 'src', 'roster.txt'), 'utf8');
+const EMPTY = process.argv.includes('--empty');
+const raw = EMPTY ? '' : readFileSync(join(root, 'src', 'roster.txt'), 'utf8');
 const rows = raw
   .split(/\r?\n/)
   .map((s) => s.trim())
@@ -21,7 +22,7 @@ const rows = raw
     return { name, weight: num };
   });
 
-if (rows.length === 0) throw new Error('roster.txt 是空的');
+if (rows.length === 0 && !EMPTY) throw new Error('roster.txt 是空的（要发不带名单的包请加 --empty）');
 if (rows.length > 128) throw new Error('名单最多 128 人（与客户端 ROSTER_MAX 一致）');
 for (const r of rows) {
   if (/["\\|]/.test(r.name)) throw new Error('名字里不能有引号/反斜杠/竖线: ' + r.name);
@@ -31,6 +32,19 @@ for (const r of rows) {
 const esc = (s) => s.replace(/[\u0080-\uFFFF]/g, (c) => '\\u' + c.charCodeAt(0).toString(16).padStart(4, '0'));
 const num = (v) => (Number.isInteger(v) ? v.toFixed(1) : String(v));
 
+if (rows.length === 0) {
+  let e = '/* 自动生成：node tools/gen-roster.mjs --empty\n';
+  e += ' * 故意不带名单：exe 里没有任何学生姓名/权重，启动后向服务器同步。\n';
+  e += ' * 这样每次发新版都不会改动班里已有的名单。 */\n';
+  e += '#ifndef ROSTER_H\n#define ROSTER_H\n\n';
+  e += '#define ROSTER_COUNT 0\n\n';
+  e += 'static const wchar_t *const kRosterNames[1] = { L"" };\n\n';
+  e += 'static const double kRosterWeights[1] = { 1.0 };\n\n';
+  e += '#endif\n';
+  writeFileSync(join(root, 'src', 'roster.h'), e, 'utf8');
+  console.log('roster.h: EMPTY (no baked names)');
+  process.exit(0);
+}
 let out = '/* 自动生成：node tools/gen-roster.mjs —— 不要手改本文件，改 src/roster.txt */\n';
 out += '#ifndef ROSTER_H\n#define ROSTER_H\n\n';
 out += `#define ROSTER_COUNT ${rows.length}\n\n`;

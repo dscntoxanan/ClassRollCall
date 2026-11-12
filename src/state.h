@@ -21,8 +21,12 @@ typedef struct {
     int           defaultCount;
     int           nextId;
     int           nextUsed;
+    int           seeded;                      /* 1 = 名单曾由服务器下发过，不再用 exe 里的出厂名单 */
+    int           rosterRev;                   /* 本地名单对应的“名单版本号”（服务器发布时 +1） */
+    char          rosterMd5[33];               /* 本地名单的 md5，用来发现名单被改过 */
     wchar_t       className[STATE_CLASS_WCHARS];
     wchar_t       nextName[STATE_NAME_WCHARS];
+    wchar_t       subName[STATE_NAME_WCHARS];   /* 选中的科目（空 = 正常权重） */
     unsigned char hist[STATE_HIST][STATE_MAX];
 
     int           histN;

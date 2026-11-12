@@ -10,6 +10,12 @@
     POST /api/admin/logout               退出
     GET  /api/admin/state                读取状态（需登录）
     POST /api/admin/save                 保存概率（需登录，X-RC 头防 CSRF）
+    GET  /api/admin/grades               读取成绩科目与每科权重（需登录）
+    POST /api/admin/grades/parse         上传 XML（请求体是原始字节）-> 解析预览
+    POST /api/admin/grades/apply         确认列 -> 科目映射，写入分数并算权重
+    POST /api/admin/grades/subject       单科启用/停用
+    POST /api/admin/grades/rule          改 W_MAX / FLOOR 并立即重算
+    POST /api/admin/grades/clear         清除全部成绩
     POST /api/rollcall/sync?k=..&n=..    客户端同步（共享 key）
 
 数据文件：
@@ -21,10 +27,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 import threading
 import time
 import urllib.parse
+import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -150,7 +158,499 @@ def _state_normalize(st):
         st["next_id"] = int(st.get("next_id") or 0)
     except (TypeError, ValueError):
         st["next_id"] = 0
+
+    # 成绩 / 科目：规则与分数都要规范化，坏值回默认，别让脏数据把 sync 打崩
+    st["weight_rule"] = _rule_norm(st.get("weight_rule"))
+    st["subjects"] = _subjects_norm(st.get("subjects"))
     return st
+
+
+# ---------------------------------------------------------------- 成绩 / 科目
+#
+# state["weight_rule"] = {"w_max": 5.0, "floor": 0.6}
+# state["subjects"]    = {"语文": {"full": 100.0, "enabled": True,
+#                                 "scores": {"张三": 90.0, "李四": None}}}
+#                        scores 里 None = 缺考（没有分数）
+#
+# 权重规则（按「离平均分多远」分段线性，锚点：最低分=W_MAX、平均分=1.0、最高分=FLOOR）
+#     低于平均分：w = W_MAX + (1.0 - W_MAX) * (score - min) / (avg - min)
+#     高于平均分：w = 1.0   + (FLOOR - 1.0) * (score - avg) / (max - avg)
+#     全班同分   -> 全员 1.0；缺考（score 为 None）-> FLOOR
+
+W_MAX_DEFAULT = 5.0
+FLOOR_DEFAULT = 0.6
+MID_WEIGHT = 1.0      # 等于平均分那位的权重（固定，不给后台改）
+GRADE_MAX_BYTES = 2 * 1024 * 1024   # 上传的 XML 上限
+GRADE_MAX_ROWS = 500                # 一次导入最多保留多少条记录
+MAX_SUBJECTS = 24
+PARSE_TTL = 3600                    # 解析结果在内存里留多久（秒）
+_parse_cache = {}                   # cid -> {"id","ts","data"}
+_parse_lock = threading.Lock()
+
+SUBJECT_ORDER = ("语文", "数学", "英语", "物理", "化学", "生物", "政治", "历史", "地理")
+
+# (标准科目名, 别名)：仅用于“猜”，猜错可以在后台手动改
+_SUBJECT_ALIAS = (
+    ("语文", ("语文", "chinese", "yuwen", "chn", "yw")),
+    ("数学", ("数学", "mathematics", "math", "maths", "shuxue", "sx")),
+    ("英语", ("英语", "english", "yingyu", "eng", "yy")),
+    ("物理", ("物理", "physics", "wuli", "wl")),
+    ("化学", ("化学", "chemistry", "huaxue", "hx")),
+    ("生物", ("生物", "biology", "shengwu", "sw")),
+    ("政治", ("政治", "思想政治", "道德与法治", "道法", "politics", "zhengzhi", "zz")),
+    ("历史", ("历史", "history", "lishi", "ls")),
+    ("地理", ("地理", "geography", "dili", "dl")),
+)
+
+# 像“姓名”的字段名
+_NAME_KEYS = ("姓名", "名字", "学生姓名", "学生名", "学生", "考生姓名", "考生",
+              "name", "studentname", "stuname", "student", "xm", "xingming")
+
+# 字符串里出现这些，就当“没有分数”
+_ABSENT_WORDS = ("", "-", "--", "—", "－", "/", "缺考", "缺", "免考", "未考",
+                 "未参加", "无", "n/a", "na", "absent", "none", "null")
+
+
+def _subj_key(s):
+    """列名归一化：全角转半角、去空白与标点、转小写。"""
+    out = []
+    for ch in str(s or ""):
+        o = ord(ch)
+        if 0xFF01 <= o <= 0xFF5E:
+            ch = chr(o - 0xFEE0)
+        out.append(ch)
+    t = "".join(out).strip().lower()
+    return re.sub(r"[\s_\-./\\:：、,，;；()（）\[\]【】<>《》\"'`]+", "", t)
+
+
+_NAME_EXACT = frozenset(_subj_key(x) for x in _NAME_KEYS)
+
+
+def clean_subject_name(s):
+    """科目名清洗：去掉 | 和不可见字符（| 是 sync 协议的分隔符），限长 20。"""
+    t = re.sub(r"[\x00-\x1f\x7f]", "", str(s or ""))
+    t = t.replace("|", "").replace("｜", "").strip()
+    t = re.sub(r"\s+", " ", t)
+    return t[:20]
+
+
+def guess_subject(field):
+    """字段名/属性名 -> 标准科目名；猜不到返回空串。"""
+    k = _subj_key(field)
+    if not k:
+        return ""
+    for subj, aliases in _SUBJECT_ALIAS:
+        for a in aliases:
+            if a.isascii():
+                if k == a:
+                    return subj
+                # 长别名允许前后缀（englishtotal / total_english）
+                if len(a) >= 3 and (k.startswith(a) or k.endswith(a)):
+                    return subj
+            elif a in k:
+                return subj
+    return ""
+
+
+def _is_name_field(field):
+    k = _subj_key(field)
+    if not k:
+        return False
+    for a in _NAME_EXACT:
+        if a and (k == a or a in k):
+            return True
+    return False
+
+
+def _to_score(v):
+    """任意值 -> float；认不出来就返回 None（None 表示缺考/没有分数）。"""
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not s:
+        return None
+    if s.lower() in _ABSENT_WORDS:
+        return None
+    s = s.replace(",", "").replace("，", "").replace(" ", "").replace("\u3000", "")
+    if s.endswith("分"):
+        s = s[:-1]
+    try:
+        f = float(s)
+    except ValueError:
+        return None
+    if f != f or f in (float("inf"), float("-inf")):
+        return None
+    return f
+
+
+def _rule_norm(r):
+    r = r if isinstance(r, dict) else {}
+    w_max = _to_score(r.get("w_max"))
+    if w_max is None or w_max <= 0:
+        w_max = W_MAX_DEFAULT
+    w_max = max(0.1, min(100.0, w_max))
+    floor = _to_score(r.get("floor"))
+    if floor is None or floor < 0:
+        floor = FLOOR_DEFAULT
+    floor = max(0.0, min(w_max, floor))
+    return {"w_max": round(w_max, 4), "floor": round(floor, 4)}
+
+
+def _rule_values(st):
+    """取生效的 W_MAX / FLOOR。0 是合法值（全下不设下限），不能用 or 兜底。"""
+    rule = st.get("weight_rule") or {}
+    w_max = _to_score(rule.get("w_max"))
+    floor = _to_score(rule.get("floor"))
+    if w_max is None or w_max <= 0:
+        w_max = W_MAX_DEFAULT
+    if floor is None or floor < 0:
+        floor = FLOOR_DEFAULT
+    return w_max, min(floor, w_max)
+
+
+def _subjects_norm(src):
+    """把 state["subjects"] 收拾干净：科目名去 |、满分夹范围、分数统一成 float/None。"""
+    src = src if isinstance(src, dict) else {}
+    out = {}
+    for name, info in src.items():
+        nm = clean_subject_name(name)
+        if not nm or nm in out or len(out) >= MAX_SUBJECTS:
+            continue
+        info = info if isinstance(info, dict) else {}
+        full = _to_score(info.get("full"))
+        if full is None or full <= 0:
+            full = 100.0
+        full = max(1.0, min(1000.0, full))
+        raw = info.get("scores") if isinstance(info.get("scores"), dict) else {}
+        sc = {}
+        for k, v in raw.items():
+            kk = str(k or "").strip()
+            if not kk:
+                continue
+            sv = _to_score(v)
+            sc[kk] = None if sv is None else round(sv, 4)
+        out[nm] = {"full": round(full, 4),
+                   "enabled": bool(info.get("enabled", True)),
+                   "scores": sc}
+    return out
+
+
+def subject_names(st):
+    """科目显示顺序：先按常见科目顺序，其余按名字排。"""
+    subs = st.get("subjects") or {}
+    known = [x for x in SUBJECT_ORDER if x in subs]
+    other = sorted(x for x in subs if x not in SUBJECT_ORDER)
+    return known + other
+
+
+def compute_subject_weights(names, scores, full, w_max, floor):
+    """按「离平均分多远」算权重（分段线性，三个锚点严格成立）。
+
+    names   : 名单（顺序即 sync 里 n= 的顺序）
+    scores  : {姓名: 分数或 None}
+    full    : 本科满分（仅存档，公式已不用）
+    w_max   : 最低分那位的权重（默认 5.0）
+    floor   : 最高分那位的权重（默认 0.6）
+
+    锚点：最低分 -> w_max；等于平均分 -> MID(1.0)；最高分 -> floor。
+      低于平均分：w = w_max + (MID - w_max) * (score - min) / (avg - min)
+      高于平均分：w = MID   + (floor - MID) * (score - avg) / (max - avg)
+      全班同分    ：全员 MID
+      缺考        ：floor
+    """
+    w_max = float(w_max)
+    floor = float(floor)
+    mid = MID_WEIGHT
+    if floor > w_max:
+        floor = w_max
+
+    vals = []
+    for nm in names:
+        s = scores.get(nm)
+        vals.append(None if s is None else float(s))
+    present = [v for v in vals if v is not None]
+    if present:
+        avg = sum(present) / len(present)
+        vmin = min(present)
+        vmax = max(present)
+    else:
+        avg = vmin = vmax = 0.0
+
+    ws = []
+    rows = []
+    for nm, s in zip(names, vals):
+        if s is None:
+            w = floor
+        elif vmax <= vmin:
+            w = mid                       # 全班同分：谁都一样
+        elif s <= avg:
+            if avg <= vmin:
+                w = mid
+            else:
+                w = w_max + (mid - w_max) * (s - vmin) / (avg - vmin)
+        else:
+            if vmax <= avg:
+                w = mid
+            else:
+                w = mid + (floor - mid) * (s - avg) / (vmax - avg)
+        if w < floor:
+            w = floor
+        if w > w_max:
+            w = w_max
+        w = round(w, 4)
+        ws.append(w)
+        rows.append({"name": nm,
+                     "score": (None if s is None else round(s, 4)),
+                     "diff": (None if s is None else round(s - avg, 4)),
+                     "weight": w})
+    stats = {"count": len(names),
+             "missing": sum(1 for v in vals if v is None),
+             "avg": round(avg, 4), "min": round(vmin, 4), "max": round(vmax, 4),
+             "max_weight": (max(ws) if ws else 0.0)}
+    return ws, rows, stats
+
+def grades_json(st, limit=20):
+    """后台用的成绩视图：每科一份权重表（默认只给前 limit 行）。"""
+    w_max, floor = _rule_values(st)
+    names = st.get("names") or []
+    subs = []
+    for subj in subject_names(st):
+        info = (st.get("subjects") or {}).get(subj) or {}
+        scores = info.get("scores") or {}
+        has_data = any(scores.get(n) is not None for n in names)
+        _ws, rows, stats = compute_subject_weights(
+            names, scores, info.get("full") or 100.0, w_max, floor)
+        subs.append({
+            "name": subj,
+            "enabled": bool(info.get("enabled", True)),
+            "full": float(info.get("full") or 100.0),
+            "has_data": has_data,
+            "count": stats["count"],
+            "missing": stats["missing"],
+            "avg": stats["avg"],
+            "rows_total": len(rows),
+            "rows": rows[:limit],
+            "truncated": len(rows) > limit,
+        })
+    return {"ok": True, "rule": {"w_max": w_max, "floor": floor},
+            "names": len(names), "subjects": subs}
+
+
+def _sync_subject_lines(st):
+    """sync 响应末尾追加的 sub= 行：只发「有数据且启用」的科目。"""
+    names = st.get("names") or []
+    if not names:
+        return ""       # 服务器没有名单就没法对齐权重，一行都不发
+    w_max, floor = _rule_values(st)
+    out = []
+    for subj in subject_names(st):
+        info = (st.get("subjects") or {}).get(subj) or {}
+        if not info.get("enabled", True):
+            continue
+        scores = info.get("scores") or {}
+        if not any(scores.get(n) is not None for n in names):
+            continue    # 没有数据 / 全都是缺考 -> 不发
+        ws, _rows, _stats = compute_subject_weights(
+            names, scores, info.get("full") or 100.0, w_max, floor)
+        out.append("sub=%s|1|%s\n" % (subj, ",".join("%.4g" % w for w in ws)))
+    return "".join(out)
+
+
+# ---- XML 解析 ------------------------------------------------------------
+
+def decode_xml_bytes(raw):
+    """猜编码并解码，返回 (文本, 编码名)。顺序：BOM -> XML 声明 -> UTF-8 -> GB18030。"""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        return raw[3:].decode("utf-8"), "utf-8-bom"
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return raw.decode("utf-16"), "utf-16"
+    m = re.search(rb"encoding\s*=\s*[\"']([A-Za-z0-9_\-]+)[\"']", raw[:400])
+    declared = (m.group(1).decode("ascii", "ignore").lower() if m else "")
+    if declared in ("gbk", "gb2312", "gb18030", "gb_2312-80"):
+        tries = (("gb18030", "gbk"), ("utf-8", "utf-8"))
+    else:
+        tries = (("utf-8", "utf-8"), ("gb18030", "gbk"))
+    for codec, label in tries:
+        try:
+            return raw.decode(codec), label
+        except UnicodeDecodeError:
+            continue
+    raise ValueError("认不出文件编码（UTF-8 和 GBK 都解不开），请用记事本另存为 UTF-8 再试")
+
+
+def _localname(tag):
+    t = str(tag or "")
+    if "}" in t:
+        t = t.split("}", 1)[1]
+    return t.strip()
+
+
+def _flat_fields(elem):
+    """把一个元素摊平：属性 + 没有子节点的子节点 -> [(字段名, 原始值)]。"""
+    out = []
+    for k, v in elem.attrib.items():
+        out.append((_localname(k), (v or "").strip()))
+    for ch in list(elem):
+        if len(list(ch)):
+            continue
+        name = _localname(ch.tag)
+        val = (ch.text or "").strip()
+        out.append((name, val))
+        for k2, v2 in ch.attrib.items():
+            out.append((name + "." + _localname(k2), (v2 or "").strip()))
+    return out
+
+
+def suggest_full(mx):
+    """按该列最大值猜满分：<=100 -> 100，<=150 -> 150，<=200 -> 200，再往上取 50 的倍数。"""
+    mx = float(mx or 0)
+    if mx <= 100:
+        return 100.0
+    if mx <= 150:
+        return 150.0
+    if mx <= 200:
+        return 200.0
+    return float(int((mx + 49) // 50) * 50)
+
+
+def parse_grade_xml(raw):
+    """把任意结构的成绩 XML 解析成「学生行 + 列」。
+
+    识别规则：
+      1. 一条记录 = 一个元素：它的子节点全是叶子（或只有属性），
+         并且里面既有像姓名的字段，又有至少一个数字字段；
+      2. 同名的记录元素按出现次数最多的一组作为“真正的一张表”；
+      3. 列 = 这组记录里出现过的所有字段名（按首次出现顺序）。
+    解析不出来就抛 ValueError（中文原因），绝不返回空表糊过去。
+    """
+    text, enc = decode_xml_bytes(raw)
+    if not text.strip():
+        raise ValueError("文件是空的，没有内容可解析")
+    # 编码已经用过了，把声明里的 encoding 去掉，免得 ElementTree 再按字面解一次
+    text = re.sub(r"(<\?xml[^>]*?)\s+encoding\s*=\s*[\"'][^\"']*[\"']", r"\1", text, count=1)
+    try:
+        root = ET.fromstring(text)
+    except ET.ParseError as e:
+        pos = getattr(e, "position", None) or (0, 0)
+        raise ValueError("XML 格式错误：第 %d 行第 %d 列 —— %s" % (pos[0], max(1, pos[1] + 1), e))
+
+    cands = {}
+    for elem in root.iter():
+        kids = list(elem)
+        if any(len(list(k)) for k in kids):
+            continue                      # 子节点还带子节点：这是容器，不是一条记录
+        fields = _flat_fields(elem)
+        if not fields:
+            continue
+        tag = _localname(elem.tag) or "?"
+        nums = 0
+        namecol = ""
+        exact = False
+        for fname, fval in fields:
+            if fval and _is_name_field(fname):
+                if not namecol:
+                    namecol = fname
+                if _subj_key(fname) in _NAME_EXACT:
+                    exact = True
+            if _to_score(fval) is not None:
+                nums += 1
+        if not namecol or nums < 1:
+            continue
+        g = cands.get(tag)
+        if g is None:
+            g = cands[tag] = {"tag": tag, "rows": [], "cols": [], "seen": set(),
+                              "num_n": 0, "exact": False}
+        g["rows"].append(fields)
+        for fname, _v in fields:
+            if fname not in g["seen"]:
+                g["seen"].add(fname)
+                g["cols"].append(fname)
+        if nums > g["num_n"]:
+            g["num_n"] = nums
+        if exact:
+            g["exact"] = True
+
+    if not cands:
+        tags = sorted({_localname(e.tag) for e in root.iter()})
+        raise ValueError(
+            "没找到成绩记录：需要这样的元素 —— 里面既有像姓名的字段，又有至少一个数字字段。"
+            "文件里出现的元素有：%s" % ("、".join(tags[:12]) or "（无）"))
+
+    best = max(cands.values(), key=lambda g: (len(g["rows"]), g["num_n"], g["exact"]))
+    cols = best["cols"]
+    rows = []
+    filled = {c: 0 for c in cols}
+    numeric = {c: 0 for c in cols}
+    for fields in best["rows"]:
+        d = {}
+        for k, v in fields:
+            if k in d and d[k]:
+                continue                  # 同名字段重复：前者非空就保留前者
+            d[k] = v
+        rows.append(d)
+        for c in cols:
+            v = str(d.get(c, "")).strip()
+            if v:
+                filled[c] += 1
+            if _to_score(v) is not None:
+                numeric[c] += 1
+
+    total = len(rows)
+    if total > GRADE_MAX_ROWS:
+        rows = rows[:GRADE_MAX_ROWS]
+
+    # 姓名列：先精确命中 -> 再包含关键字 -> 最后拿第一个“基本不是数字”的列
+    name_col = ""
+    for c in cols:
+        if _subj_key(c) in _NAME_EXACT and numeric[c] == 0:
+            name_col = c
+            break
+    if not name_col:
+        for c in cols:
+            if _is_name_field(c) and numeric[c] == 0:
+                name_col = c
+                break
+    if not name_col:
+        for c in cols:
+            if numeric[c] == 0 and filled[c] >= max(1, total // 2):
+                name_col = c
+                break
+
+    colmeta = []
+    for c in cols:
+        mx = max([_to_score(r.get(c)) or 0 for r in rows
+                  if _to_score(r.get(c)) is not None] or [0])
+        colmeta.append({
+            "key": c,
+            "numeric": filled[c] > 0 and numeric[c] * 2 >= filled[c],
+            "numeric_ratio": round(numeric[c] / filled[c], 3) if filled[c] else 0.0,
+            "guess": guess_subject(c),
+            "samples": [str(r.get(c, ""))[:24] for r in rows[:3]],
+            "max": round(mx, 4),
+            "suggest_full": suggest_full(mx),
+        })
+
+    warnings = []
+    got = [c["guess"] for c in colmeta if c["guess"]]
+    if not got:
+        warnings.append("没认出任何科目列，请在下面手动把 XML 列指到科目上")
+    if not name_col:
+        warnings.append("没找到像姓名的列，请在下面手动选一列当姓名，否则导入会失败")
+    if total > len(rows):
+        warnings.append("文件里有 %d 条记录，只取前 %d 条" % (total, len(rows)))
+    if total == 0:
+        warnings.append("一条记录都没读到")
+
+    return {
+        "encoding": enc,
+        "record_tag": best["tag"],
+        "total": total,
+        "name_column": name_col,
+        "columns": colmeta,
+        "rows": [{"name": str(r.get(name_col, "")).strip() if name_col else "",
+                  "cells": {c: str(r.get(c, "")) for c in cols}} for r in rows],
+        "warnings": warnings,
+    }
 
 
 # ---------------------------------------------------------------- 班级（多租户）
@@ -438,6 +938,37 @@ PANEL_HTML = """<!doctype html>
   .del{height:26px;padding:0 8px;background:transparent;color:var(--sub);border:1px solid var(--line);
        border-radius:7px;font-size:13px;line-height:1}
   .del:hover{color:#c0392b;border-color:#e5b8b2}
+  .gsec{margin:30px 0 10px;border-top:1px solid var(--line);padding-top:18px}
+  .gsec h2{margin:0 0 12px;font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+  .gsec h2 .tag{font-weight:400;color:var(--sub);font-size:12px}
+  .gup{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px}
+  .gup input[type=file]{font:inherit;font-size:12.5px;color:var(--sub);max-width:230px}
+  .gwarn{background:#fff7e8;border:1px solid #f0dcb4;color:#7a5a13;border-radius:9px;
+       padding:9px 12px;font-size:12.5px;margin:8px 0;line-height:1.6}
+  .gmap{display:grid;grid-template-columns:1fr 104px 74px 116px;gap:8px 10px;align-items:center;
+       padding:7px 0;border-bottom:1px solid #f0eee9;font-size:12.5px}
+  .gmap .k{color:var(--sub);word-break:break-all;line-height:1.4}
+  .gmap select{height:32px;padding:0 8px;border:1px solid var(--line);border-radius:8px;font:inherit;
+       background:#fff;outline:none;width:100%}
+  .gmap input{width:100%;height:32px;text-align:center}
+  .gcard{border:1px solid var(--line);border-radius:11px;padding:12px 14px;margin:12px 0;background:#fff}
+  .gcard h3{margin:0 0 9px;font-size:13.5px;font-weight:600;display:flex;align-items:center;
+       gap:10px;flex-wrap:wrap}
+  .gcard .sub{color:var(--sub);font-weight:400;font-size:12px}
+  .gtbl{width:100%;border-collapse:collapse;font-size:12.5px;font-variant-numeric:tabular-nums}
+  .gtbl th{color:var(--sub);font-weight:400;text-align:right;padding:6px 4px;border-bottom:1px solid var(--line)}
+  .gtbl th:first-child,.gtbl td:first-child{text-align:left}
+  .gtbl td{padding:6px 4px;border-bottom:1px solid #f5f3ee;text-align:right}
+  .gtbl tr:last-child td{border-bottom:0}
+  .gtbl td.miss{color:#c0392b}
+  .gck{display:flex;align-items:center;gap:6px;font-size:12.5px;color:var(--sub);cursor:pointer}
+  .gck input{width:auto;height:auto}
+  .gmore{margin-top:8px;font-size:12px;color:var(--sub)}
+  .gfoot{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:14px 0 6px;
+       font-size:12.5px;color:var(--sub)}
+  .gfoot button{height:34px;padding:0 16px}
+  .gfoot input{width:62px;height:32px;text-align:center}
+  .gfoot label{display:flex;align-items:center;gap:6px}
 </style></head><body>
 <header>
   <h1><span class="dot"></span>__CLASS__</h1>
@@ -472,6 +1003,24 @@ PANEL_HTML = """<!doctype html>
   </div>
   <div class="row head"><div>序号</div><div>姓名</div><div style="text-align:right">概率权重</div><div>占比</div><div></div></div>
   <div id="list"></div>
+
+  <section class="gsec" id="gsec">
+    <h2>成绩 / 科目 <span class="tag" id="gsum">未导入成绩</span></h2>
+    <div class="gup">
+      <input type="file" id="gfile" accept=".xml,text/xml,application/xml">
+      <button id="gupload" style="height:34px;padding:0 14px">上传并解析</button>
+      <button class="ghost" id="gclear" style="height:34px;padding:0 14px">清除成绩</button>
+    </div>
+    <div id="gwarn"></div>
+    <div id="gmap"></div>
+    <div id="glist"></div>
+    <div class="gfoot">
+      <label>最低分那位权重 <input type="number" id="gwmax" min="0.1" max="100" step="0.1" value="5"></label>
+      <label>最高分那位权重 <input type="number" id="gfloor" min="0" max="100" step="0.1" value="0.6"></label>
+      <button class="ghost" id="grule">保存规则</button>
+      <span>按平均分分段：最低分=左值、平均分=1、最高分=右值；缺考=右值</span>
+    </div>
+  </section>
 </main>
 <footer>
   <button id="save">保存修改</button>
@@ -582,6 +1131,230 @@ document.getElementById('logout').onclick=async ()=>{
   await fetch('/api/admin/logout',{method:'POST',headers:{'X-RC':'1'}});
   location.reload();
 };
+
+// ---- 成绩 / 科目 -------------------------------------------------------
+const SUBJECTS = ['语文','数学','英语','物理','化学','生物','政治','历史','地理'];
+const gmap = document.getElementById('gmap');
+const glist = document.getElementById('glist');
+const gwarn = document.getElementById('gwarn');
+const gsum = document.getElementById('gsum');
+let GPARSE = null;
+
+function el(tag, cls, text){
+  const d = document.createElement(tag);
+  if(cls) d.className = cls;
+  if(text !== undefined && text !== null) d.textContent = String(text);
+  return d;
+}
+
+function warnBox(msgs){
+  gwarn.textContent = '';
+  if(!msgs || !msgs.length) return;
+  const box = el('div','gwarn');
+  msgs.forEach(m => box.appendChild(el('div', null, '· ' + m)));
+  gwarn.appendChild(box);
+}
+
+async function gpost(url, body){
+  let r = null, j = null;
+  try {
+    r = await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-RC':'1'},
+                         body:JSON.stringify(body)});
+  } catch(e){ showToast('连不上服务器'); return null; }
+  try { j = await r.json(); } catch(e){ j = null; }
+  if(!r.ok || !j || !j.ok){
+    showToast((j && j.error) ? j.error : ('请求失败：HTTP ' + r.status));
+    return null;
+  }
+  return j;
+}
+
+function subjectCard(s){
+  const card = el('div','gcard');
+  const h = el('h3');
+  h.appendChild(el('span', null, s.name));
+  h.appendChild(el('span','sub','满分 ' + s.full + ' · 缺考 ' + s.missing + ' 人 · 平均 ' + s.avg));
+  const ck = el('label','gck');
+  const box = document.createElement('input');
+  box.type = 'checkbox'; box.checked = !!s.enabled;
+  box.onchange = async ()=>{
+    const r = await gpost('/api/admin/grades/subject', {subject:s.name, enabled:box.checked});
+    if(!r){ box.checked = !box.checked; return; }
+    renderSubjects(r);
+    showToast(box.checked ? ('已启用 ' + s.name) : ('已停用 ' + s.name + '（同步里不再下发）'));
+  };
+  ck.appendChild(box);
+  ck.appendChild(el('span', null, '启用'));
+  h.appendChild(ck);
+  card.appendChild(h);
+
+  const t = el('table','gtbl');
+  const hr = el('tr');
+  ['姓名','分数','离满分差','权重'].forEach(x => hr.appendChild(el('th', null, x)));
+  t.appendChild(hr);
+  (s.rows || []).forEach(r=>{
+    const tr = el('tr');
+    const miss = (r.score === null || r.score === undefined);
+    tr.appendChild(el('td', null, r.name));
+    tr.appendChild(el('td', miss ? 'miss' : null, miss ? '缺考' : r.score));
+    tr.appendChild(el('td', miss ? 'miss' : null, miss ? '—' : r.diff));
+    tr.appendChild(el('td', null, r.weight));
+    t.appendChild(tr);
+  });
+  card.appendChild(t);
+  if(s.truncated){
+    card.appendChild(el('div','gmore','只显示前 ' + s.rows.length + ' 行，共 ' + s.rows_total + ' 行'));
+  }
+  return card;
+}
+
+function renderSubjects(data){
+  if(!data || !data.rule) return;
+  document.getElementById('gwmax').value = data.rule.w_max;
+  document.getElementById('gfloor').value = data.rule.floor;
+  const shown = (data.subjects || []).filter(s => s.has_data);
+  gsum.textContent = shown.length
+    ? (shown.length + ' 科有数据 · 名单 ' + data.names + ' 人')
+    : '未导入成绩';
+  glist.textContent = '';
+  if(!shown.length){
+    glist.appendChild(el('div','empty','还没有成绩数据。上传一个 XML 就会在这里算出每科权重'));
+    return;
+  }
+  shown.forEach(s => glist.appendChild(subjectCard(s)));
+}
+
+function renderPreview(p){
+  GPARSE = p;
+  gmap.textContent = '';
+  warnBox(p.warnings);
+  const head = el('div','gmap');
+  head.appendChild(el('div','k','姓名列（对应名单上的名字）'));
+  const sel = document.createElement('select');
+  sel.id = 'gnamecol';
+  const o0 = document.createElement('option');
+  o0.value = ''; o0.textContent = '（请选择）';
+  sel.appendChild(o0);
+  (p.columns || []).forEach(c=>{
+    const o = document.createElement('option');
+    o.value = c.key; o.textContent = c.key;
+    sel.appendChild(o);
+  });
+  if(p.name_column) sel.value = p.name_column;
+  head.appendChild(sel);
+  head.appendChild(el('div','k', p.total + ' 条记录'));
+  head.appendChild(el('div','k','编码 ' + p.encoding));
+  gmap.appendChild(head);
+
+  (p.columns || []).forEach(c=>{
+    const row = el('div','gmap');
+    row.appendChild(el('div','k', c.key + '　最大 ' + c.max + (c.numeric ? '' : '　（非数字列）')));
+    const s = document.createElement('select');
+    s.className = 'gsub';
+    s.dataset.col = c.key;
+    const n0 = document.createElement('option');
+    n0.value = ''; n0.textContent = '（不用）';
+    s.appendChild(n0);
+    SUBJECTS.forEach(x=>{
+      const o = document.createElement('option');
+      o.value = x; o.textContent = x;
+      s.appendChild(o);
+    });
+    if(c.guess) s.value = c.guess;
+    row.appendChild(s);
+    const f = document.createElement('input');
+    f.type = 'number'; f.min = '1'; f.max = '1000'; f.step = '1';
+    f.className = 'gfull';
+    f.dataset.col = c.key;
+    f.value = c.suggest_full || 100;
+    row.appendChild(f);
+    row.appendChild(el('div','k', (c.guess ? ('猜：' + c.guess) : '未识别科目')));
+    gmap.appendChild(row);
+  });
+
+  const bar = el('div','gfoot');
+  const btn = document.createElement('button');
+  btn.textContent = '应用到名单';
+  btn.onclick = applyGrades;
+  bar.appendChild(btn);
+  bar.appendChild(el('span', null, '只写入选中的科目；同名科目会被覆盖，其他科目不动'));
+  gmap.appendChild(bar);
+}
+
+async function applyGrades(){
+  if(!GPARSE){ showToast('先上传并解析 XML'); return; }
+  const nameCol = (document.getElementById('gnamecol') || {}).value || '';
+  if(!nameCol){ showToast('先选姓名列'); return; }
+  const map = {}, full = {}, seen = {};
+  let dup = '';
+  [...gmap.querySelectorAll('select.gsub')].forEach(s=>{
+    if(!s.value) return;
+    if(seen[s.value]){ dup = s.value; }
+    seen[s.value] = 1;
+    map[s.value] = s.dataset.col;
+    const f = [...gmap.querySelectorAll('input.gfull')].filter(x => x.dataset.col === s.dataset.col)[0];
+    full[s.value] = f ? (parseFloat(f.value) || 100) : 100;
+  });
+  if(dup){ showToast('「' + dup + '」被指了两列，请只留一个'); return; }
+  if(!Object.keys(map).length){ showToast('至少把一列指给一个科目'); return; }
+  const r = await gpost('/api/admin/grades/apply',
+    {parse_id: GPARSE.parse_id, name_column: nameCol, map: map, full: full});
+  if(!r) return;
+  GPARSE = null;
+  gmap.textContent = '';
+  warnBox(r.warnings);
+  renderSubjects(r);
+  showToast('已导入：' + ((r.applied || []).join('、') || '无'));
+}
+
+async function uploadGrades(){
+  const inp = document.getElementById('gfile');
+  const f = inp.files && inp.files[0];
+  if(!f){ showToast('先选一个 XML 文件'); return; }
+  if(f.size > 2 * 1024 * 1024){ showToast('文件超过 2 MB'); return; }
+  let buf = null;
+  try { buf = await f.arrayBuffer(); } catch(e){ showToast('读不到文件内容'); return; }
+  let r = null, j = null;
+  try {
+    r = await fetch('/api/admin/grades/parse',
+      {method:'POST',headers:{'Content-Type':'application/xml','X-RC':'1'},body:buf});
+  } catch(e){ showToast('连不上服务器'); return; }
+  try { j = await r.json(); } catch(e){ j = null; }
+  if(!r.ok || !j || !j.ok){
+    showToast((j && j.error) ? j.error : ('解析失败：HTTP ' + r.status));
+    return;
+  }
+  renderPreview(j);
+  showToast('识别到 ' + (j.columns || []).length + ' 列、' + j.total + ' 条记录');
+}
+
+async function saveRule(){
+  const w = parseFloat(document.getElementById('gwmax').value);
+  const fl = parseFloat(document.getElementById('gfloor').value);
+  if(!isFinite(w) || !isFinite(fl)){ showToast('两个框都要填数字'); return; }
+  const r = await gpost('/api/admin/grades/rule', {w_max:w, floor:fl});
+  if(r){ renderSubjects(r); showToast('规则已保存，客户端下次同步生效'); }
+}
+
+document.getElementById('gupload').onclick = uploadGrades;
+document.getElementById('grule').onclick = saveRule;
+document.getElementById('gclear').onclick = async ()=>{
+  if(!confirm('清空所有科目的成绩？（名单和手动权重不受影响）')) return;
+  const r = await gpost('/api/admin/grades/clear', {});
+  if(!r) return;
+  GPARSE = null;
+  gmap.textContent = '';
+  warnBox([]);
+  renderSubjects(r);
+  showToast('成绩已清空');
+};
+
+(async ()=>{
+  try {
+    const r = await fetch('/api/admin/grades?limit=20');
+    if(r.ok) renderSubjects(await r.json());
+  } catch(e){}
+})();
 </script></body></html>"""
 
 
@@ -746,6 +1519,22 @@ def escape_html(s):
 
 # ---------------------------------------------------------------- HTTP
 
+def roster_md5(names):
+    """名单指纹：UTF-8、按顺序用 \n 连接。客户端用同一算法校验本地名单是否被改过。"""
+    h = hashlib.md5()
+    h.update("\n".join(names or []).encode("utf-8"))
+    return h.hexdigest()
+
+
+def roster_track(st):
+    """名单一变就把版本号 +1 并刷新 md5（任何入口改名单都会在这里被发现）。"""
+    names = st.get("names") or []
+    cur = roster_md5(names)
+    if st.get("roster_md5") != cur:
+        st["roster_rev"] = int(st.get("roster_rev") or 0) + 1
+        st["roster_md5"] = cur
+    return st
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "RollCall/1.0"
     protocol_version = "HTTP/1.1"
@@ -798,6 +1587,14 @@ class Handler(BaseHTTPRequestHandler):
         if n <= 0 or n > limit:
             return b""
         return self.rfile.read(n)
+
+    def _payload(self, limit=65536):
+        """读 JSON 请求体；不是对象就返回 None（调用方统一回 400）。"""
+        try:
+            obj = json.loads(self._body(limit).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return None
+        return obj if isinstance(obj, dict) else None
 
     def _client_ip(self):
         fwd = self.headers.get("X-Real-IP") or self.headers.get("X-Forwarded-For") or ""
@@ -856,6 +1653,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(200, classes_json())
             return self._json(200, state_read(cid))
 
+        if path == "/api/admin/grades":
+            return self.grades_get(q)
+
         return self._send(404, "not found")
 
     def do_POST(self):
@@ -895,6 +1695,21 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/admin/newtoken":
             return self.newtoken()
+
+        if path == "/api/admin/grades/parse":
+            return self.grades_parse()
+
+        if path == "/api/admin/grades/apply":
+            return self.grades_apply()
+
+        if path == "/api/admin/grades/subject":
+            return self.grades_subject()
+
+        if path == "/api/admin/grades/rule":
+            return self.grades_rule()
+
+        if path == "/api/admin/grades/clear":
+            return self.grades_clear()
 
         return self._send(404, "not found")
 
@@ -1018,6 +1833,239 @@ class Handler(BaseHTTPRequestHandler):
         return self._json(200, {"ok": True, "updated": st["updated"],
                                 "round_seconds": st.get("round_seconds"),
                                 "hist_draws": st.get("hist_draws")})
+
+    # -- 成绩 / 科目 ------------------------------------------------------
+    def _grade_authed(self):
+        """成绩类接口的统一鉴权：必须是某个班级的会话，且带 X-RC 头。"""
+        cid = self._authed()
+        if not cid or cid == MASTER_ID:
+            self._json(401, {"ok": False, "error": "unauthorized"})
+            return None
+        if self.headers.get("X-RC") != "1":
+            self._json(403, {"ok": False, "error": "csrf"})
+            return None
+        return cid
+
+    def _bump(self, cid, st):
+        st["updated"] = int(time.time())
+        st["rev"] = int(st.get("rev") or 0) + 1
+        state_write(cid, st)
+
+    def grades_get(self, q):
+        cid = self._authed()
+        if not cid or cid == MASTER_ID:
+            return self._json(401, {"ok": False, "error": "unauthorized"})
+        try:
+            limit = int((q.get("limit") or ["20"])[0])
+        except (TypeError, ValueError):
+            limit = 20
+        limit = max(1, min(200, limit))
+        with _lock:
+            st = state_read(cid)
+        return self._json(200, grades_json(st, limit))
+
+    def grades_parse(self):
+        """请求体 = XML 原始字节（不是 JSON），这样 GBK/UTF-8 都能自己判。"""
+        cid = self._grade_authed()
+        if not cid:
+            return
+        raw = self._body(GRADE_MAX_BYTES + 1)
+        if not raw:
+            return self._json(400, {"ok": False,
+                                    "error": "没收到文件内容（空文件，或超过 %d 字节）"
+                                             % GRADE_MAX_BYTES})
+        if len(raw) > GRADE_MAX_BYTES:
+            return self._json(400, {"ok": False,
+                                    "error": "文件太大（上限 %d 字节）" % GRADE_MAX_BYTES})
+        try:
+            parsed = parse_grade_xml(raw)
+        except ValueError as e:
+            log_line("grades parse failed: %s (%s)" % (cid, e))
+            return self._json(400, {"ok": False, "error": str(e)})
+
+        pid = os.urandom(8).hex()
+        with _parse_lock:
+            _parse_cache[cid] = {"id": pid, "ts": time.time(), "data": parsed}
+        out = {"ok": True, "parse_id": pid}
+        out.update(parsed)
+        log_line("grades parsed: %s tag=%s rows=%d cols=%d enc=%s" % (
+            cid, parsed["record_tag"], parsed["total"], len(parsed["columns"]), parsed["encoding"]))
+        return self._json(200, out)
+
+    def grades_apply(self):
+        """把 XML 列指到科目上，写入分数并按规则算出每科权重。"""
+        cid = self._grade_authed()
+        if not cid:
+            return
+        payload = self._payload(GRADE_MAX_BYTES)
+        if payload is None:
+            return self._json(400, {"ok": False, "error": "请求体不是合法 JSON"})
+
+        pid = str(payload.get("parse_id") or "")
+        mapping = payload.get("map") if isinstance(payload.get("map"), dict) else {}
+        fulls = payload.get("full") if isinstance(payload.get("full"), dict) else {}
+
+        with _parse_lock:
+            cache = _parse_cache.get(cid)
+            if not cache or cache.get("id") != pid:
+                return self._json(409, {"ok": False, "error": "解析结果已失效，请重新上传 XML"})
+            if time.time() - cache["ts"] > PARSE_TTL:
+                _parse_cache.pop(cid, None)
+                return self._json(409, {"ok": False, "error": "解析结果超过 1 小时，请重新上传 XML"})
+            parsed = cache["data"]
+
+        cols = [c["key"] for c in parsed["columns"]]
+        name_col = str(payload.get("name_column") or parsed["name_column"] or "").strip()
+        if not name_col:
+            return self._json(400, {"ok": False, "error": "没选姓名列，无法对应到名单"})
+        if name_col not in cols:
+            return self._json(400, {"ok": False, "error": "姓名列「%s」不在文件里" % name_col})
+
+        clean_map = {}
+        used = {}
+        for subj, col in mapping.items():
+            col = str(col or "").strip()
+            if not col:
+                continue
+            s = clean_subject_name(subj)
+            if not s:
+                return self._json(400, {"ok": False, "error": "科目名不能为空（或只由 | 组成）"})
+            if col not in cols:
+                return self._json(400, {"ok": False, "error": "列「%s」不在文件里" % col})
+            if s in clean_map:
+                return self._json(400, {"ok": False, "error": "科目「%s」被指了两列" % s})
+            if col in used:
+                return self._json(400, {"ok": False,
+                                        "error": "列「%s」同时指给了「%s」和「%s」"
+                                                 % (col, used[col], s)})
+            clean_map[s] = col
+            used[col] = s
+        if not clean_map:
+            return self._json(400, {"ok": False, "error": "至少要把一列指给一个科目"})
+        if len(clean_map) > MAX_SUBJECTS:
+            return self._json(400, {"ok": False, "error": "科目太多（最多 %d 个）" % MAX_SUBJECTS})
+
+        with _lock:
+            st = state_read(cid)
+        roster = list(st.get("names") or [])
+        roster_set = set(roster)
+
+        warnings = []
+        new_subs = {}
+        for subj, col in clean_map.items():
+            meta = parsed["columns"][cols.index(col)]
+            full = _to_score(fulls.get(subj))
+            if full is None or full <= 0:
+                full = float(meta.get("suggest_full") or 100.0)
+            full = max(1.0, min(1000.0, float(full)))
+            scores = {}
+            bad = 0
+            dups = 0
+            blank = 0
+            for i, row in enumerate(parsed["rows"]):
+                nm = str(row.get("name") or "").strip()
+                if not nm:
+                    blank += 1
+                    continue
+                raw_v = str((row.get("cells") or {}).get(col, ""))
+                sv = _to_score(raw_v)
+                if sv is None and raw_v.strip().lower() not in _ABSENT_WORDS and raw_v.strip():
+                    bad += 1
+                    if bad <= 3:
+                        warnings.append("第 %d 条记录「%s」的「%s」是「%s」，不是数字，按缺考处理"
+                                        % (i + 1, nm, subj, raw_v[:20]))
+                if nm in scores:
+                    dups += 1
+                scores[nm] = sv
+            if bad > 3:
+                warnings.append("「%s」还有 %d 个非数字值，都按缺考处理" % (subj, bad - 3))
+            if dups:
+                warnings.append("「%s」里有 %d 条重名学生，只保留最后一条" % (subj, dups))
+            if blank:
+                warnings.append("「%s」有 %d 条记录姓名为空，已跳过" % (subj, blank))
+            extra = [n for n in scores if roster_set and n not in roster_set]
+            if extra:
+                warnings.append("「%s」有 %d 人不在本班名单里（如 %s），权重表里不会有他们；"
+                                "要统计请先加名单" % (subj, len(extra), "、".join(extra[:3])))
+            new_subs[subj] = {"full": round(full, 4), "enabled": True, "scores": scores}
+
+        with _lock:
+            st = state_read(cid)
+            subs = dict(st.get("subjects") or {})
+            subs.update(new_subs)                       # 只覆盖这次导入的科目，其它科目不动
+            st["subjects"] = _subjects_norm(subs)
+            st["weight_rule"] = _rule_norm(st.get("weight_rule"))
+            self._bump(cid, st)
+            out = grades_json(state_read(cid), 20)
+
+        out["warnings"] = warnings
+        out["applied"] = sorted(new_subs.keys())
+        log_line("grades applied: %s %s" % (cid, ",".join(sorted(new_subs.keys()))))
+        return self._json(200, out)
+
+    def grades_subject(self):
+        """单科启用/停用。停用的科目不再出现在 sync 里。"""
+        cid = self._grade_authed()
+        if not cid:
+            return
+        payload = self._payload()
+        if payload is None:
+            return self._json(400, {"ok": False, "error": "请求体不是合法 JSON"})
+        subj = clean_subject_name(payload.get("subject"))
+        if not subj:
+            return self._json(400, {"ok": False, "error": "缺科目名"})
+        enabled = bool(payload.get("enabled"))
+        with _lock:
+            st = state_read(cid)
+            subs = st.get("subjects") or {}
+            if subj not in subs:
+                return self._json(404, {"ok": False, "error": "没有这个科目：%s" % subj})
+            subs[subj]["enabled"] = enabled
+            st["subjects"] = _subjects_norm(subs)
+            self._bump(cid, st)
+            out = grades_json(state_read(cid), 20)
+        log_line("grades subject: %s %s -> %s" % (cid, subj, "on" if enabled else "off"))
+        return self._json(200, out)
+
+    def grades_rule(self):
+        """改 W_MAX / FLOOR，改完立刻按新规则重算（权重是读的时候算的，不用另存）。"""
+        cid = self._grade_authed()
+        if not cid:
+            return
+        payload = self._payload()
+        if payload is None:
+            return self._json(400, {"ok": False, "error": "请求体不是合法 JSON"})
+        w_max = _to_score(payload.get("w_max"))
+        floor = _to_score(payload.get("floor"))
+        if w_max is None or floor is None:
+            return self._json(400, {"ok": False, "error": "w_max 和 floor 都必须是数字"})
+        if w_max <= 0 or w_max > 100:
+            return self._json(400, {"ok": False, "error": "w_max 要在 0.1 ~ 100 之间"})
+        if floor < 0 or floor > w_max:
+            return self._json(400, {"ok": False, "error": "floor 要在 0 ~ w_max 之间"})
+        with _lock:
+            st = state_read(cid)
+            st["weight_rule"] = {"w_max": round(w_max, 4), "floor": round(floor, 4)}
+            self._bump(cid, st)
+            out = grades_json(state_read(cid), 20)
+        log_line("grades rule: %s w_max=%s floor=%s" % (cid, w_max, floor))
+        return self._json(200, out)
+
+    def grades_clear(self):
+        """清空全部成绩（名单和手动权重不动）。"""
+        cid = self._grade_authed()
+        if not cid:
+            return
+        with _lock:
+            st = state_read(cid)
+            st["subjects"] = {}
+            st["weight_rule"] = _rule_norm(None)
+            self._bump(cid, st)
+            out = grades_json(state_read(cid), 20)
+        with _parse_lock:
+            _parse_cache.pop(cid, None)
+        log_line("grades cleared: %s" % cid)
+        return self._json(200, out)
 
     def rev(self, q):
         """只返回状态版本号（几十字节），给轮询兜底用；不写任何状态。"""
@@ -1146,6 +2194,7 @@ class Handler(BaseHTTPRequestHandler):
                 st["weights"] = weights[:len(names)]
             st["last_sync"] = int(time.time())
             st["sync_count"] = int(st.get("sync_count") or 0) + 1
+            roster_track(st)          # 名单变了就 +1 版本、刷新 md5
             state_write(cid, st)
 
         body = "RC1\nv=%d\nrs=%d\nhd=%d\nmp=%d\ndc=%d\nwm=%d\nnxi=%d\n" % (
@@ -1162,6 +2211,11 @@ class Handler(BaseHTTPRequestHandler):
         body += "w=%s\n" % ",".join("%.4g" % float(w) for w in (st.get("weights") or []))
         if st.get("names"):
             body += "n=%s\n" % "|".join(st["names"])
+            # 名单版本 + 指纹：客户端据此决定是否采用名单、以及本地是否被改过
+            body += "rv=%d\n" % int(st.get("roster_rev") or 0)
+            body += "rm=%s\n" % (st.get("roster_md5") or roster_md5(st["names"]))
+        # 成绩科目：只在末尾追加，老客户端会忽略不认识的 sub= 行
+        body += _sync_subject_lines(st)
         return self._send(200, body, "text/plain; charset=utf-8")
 
     def next_person(self):

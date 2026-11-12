@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "state.h"
+#include "class.h"
 
 #define FILE_MAGIC "RC1"
 
@@ -21,10 +22,30 @@ static void BuildPath(wchar_t *buf)
         if (n == 0 || n >= MAX_PATH) { lstrcpyW(dir, L"."); }
     }
     {
+        wchar_t root[MAX_PATH];
         wchar_t sub[MAX_PATH];
-        wsprintfW(sub, L"%s\\XananRollCall", dir);
+        wchar_t oldFile[MAX_PATH];
+
+        wsprintfW(root, L"%s\\XananRollCall", dir);
+        CreateDirectoryW(root, NULL);
+
+        wsprintfW(sub, L"%s\\%s", root, CLASS_CODE);
         CreateDirectoryW(sub, NULL);
+
         wsprintfW(buf, L"%s\\state.dat", sub);
+        wsprintfW(oldFile, L"%s\\state.dat", root);
+
+        /* 从老位置搬一次（只在目标还不存在时） */
+        if (GetFileAttributesW(buf) == INVALID_FILE_ATTRIBUTES &&
+            GetFileAttributesW(oldFile) != INVALID_FILE_ATTRIBUTES) {
+            if (MoveFileExW(oldFile, buf, MOVEFILE_REPLACE_EXISTING)) {
+                wchar_t oldVer[MAX_PATH];
+                wsprintfW(oldVer, L"%s\\pending.exe.ver", root);
+                DeleteFileW(oldVer);
+                wsprintfW(oldVer, L"%s\\pending.exe", root);
+                DeleteFileW(oldVer);
+            }
+        }
     }
 }
 
@@ -76,6 +97,8 @@ void State_Load(StateData *sd, wchar_t names[][STATE_NAME_WCHARS], int *nameCoun
             sd->maxPick = atoi(line + 3);
         } else if (strncmp(line, "dc=", 3) == 0) {
             sd->defaultCount = atoi(line + 3);
+        } else if (strncmp(line, "seed=", 5) == 0) {
+            sd->seeded = atoi(line + 5);
         } else if (strncmp(line, "nxi=", 4) == 0) {
             sd->nextId = atoi(line + 4);
         } else if (strncmp(line, "nxu=", 4) == 0) {
@@ -90,6 +113,20 @@ void State_Load(StateData *sd, wchar_t names[][STATE_NAME_WCHARS], int *nameCoun
             int len = (int)strlen(p);
             while (len > 0 && (p[len - 1] == '\r' || p[len - 1] == '\n')) p[--len] = 0;
             if (len > 0) MultiByteToWideChar(CP_UTF8, 0, p, len, sd->className, STATE_CLASS_WCHARS - 1);
+        } else if (strncmp(line, "sub=", 4) == 0) {
+            char *p = line + 4;
+            int len = (int)strlen(p);
+            while (len > 0 && (p[len - 1] == '\r' || p[len - 1] == '\n')) p[--len] = 0;
+            if (len > 0) MultiByteToWideChar(CP_UTF8, 0, p, len, sd->subName, STATE_NAME_WCHARS - 1);
+        } else if (strncmp(line, "rv=", 3) == 0) {
+            sd->rosterRev = atoi(line + 3);
+        } else if (strncmp(line, "rm=", 3) == 0) {
+            char *p = line + 3;
+            int len = (int)strlen(p), i;
+            while (len > 0 && (p[len - 1] == '\r' || p[len - 1] == '\n')) p[--len] = 0;
+            if (len > 32) len = 32;
+            for (i = 0; i < len; i++) sd->rosterMd5[i] = (char)p[i];
+            sd->rosterMd5[len] = 0;
         } else if (strncmp(line, "d", 1) == 0 && line[1] >= '0' && line[2] >= '0' && line[3] == '=') {
             int slot = (line[1] - '0') * 10 + (line[2] - '0'), i;
             if (slot >= 0 && slot < STATE_HIST) {
@@ -165,6 +202,9 @@ void State_Save(const StateData *sd, wchar_t names[][STATE_NAME_WCHARS])
     fprintf(f, "nxi=%d\n", sd->nextId);
     fprintf(f, "nxu=%d\n", sd->nextUsed);
     fprintf(f, "n=%d\n", n);
+    fprintf(f, "seed=%d\n", sd->seeded ? 1 : 0);
+    fprintf(f, "rv=%d\n", sd->rosterRev);
+    fprintf(f, "rm=%s\n", sd->rosterMd5);
 
     {
         char utf8[STATE_CLASS_WCHARS * 4];
@@ -175,6 +215,11 @@ void State_Save(const StateData *sd, wchar_t names[][STATE_NAME_WCHARS])
         char utf8[STATE_NAME_WCHARS * 4];
         if (WideCharToMultiByte(CP_UTF8, 0, sd->nextName, -1, utf8, sizeof(utf8) - 1, NULL, NULL) > 1)
             fprintf(f, "nx=%s\n", utf8);
+    }
+    {
+        char utf8[STATE_NAME_WCHARS * 4];
+        if (WideCharToMultiByte(CP_UTF8, 0, sd->subName, -1, utf8, sizeof(utf8) - 1, NULL, NULL) > 1)
+            fprintf(f, "sub=%s\n", utf8);
     }
 
 

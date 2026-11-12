@@ -24,11 +24,14 @@ extern const wchar_t *g_syncIp;
 static void StateDir(wchar_t *buf, int cap)
 {
     wchar_t dir[MAX_PATH] = L"";
+    wchar_t root[MAX_PATH];
     (void)cap;
     if (FAILED(SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, 0, dir)) || !dir[0]) {
         GetTempPathW(MAX_PATH, dir);
     }
-    wsprintfW(buf, L"%s\\XananRollCall", dir);
+    wsprintfW(root, L"%s\\XananRollCall", dir);
+    CreateDirectoryW(root, NULL);
+    wsprintfW(buf, L"%s\\%s", root, CLASS_CODE);
     CreateDirectoryW(buf, NULL);
 }
 

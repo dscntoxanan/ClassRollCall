@@ -4,11 +4,22 @@
 /* 服务器可以下发的最大人数 / 单个姓名长度（宽字符） */
 #define NET_MAX_STUDENTS 128
 #define NET_NAME_WCHARS 24
+/* 按科目算出来的权重：后台导入成绩后，一科一套权重 */
+#define NET_MAX_SUBJECTS 12
+#define NET_SUBJECT_WCHARS 16
 
 /* 同步结果 */
 #define NET_OK      0   /* 成功 */
 #define NET_UNREACH 1   /* 根本连不上（ping/TCP 都失败）*/
 #define NET_FAILED  2   /* 连上了但请求/解析失败 */
+
+/* 一个科目：名字 + 这套权重。enabled=0 的不在菜单里出现。 */
+typedef struct {
+    wchar_t name[NET_SUBJECT_WCHARS];
+    int     enabled;
+    int     wCount;
+    double  w[NET_MAX_STUDENTS];
+} NetSubject;
 
 typedef struct {
     long long ver;
@@ -24,6 +35,10 @@ typedef struct {
     double w[NET_MAX_STUDENTS];
     int nCount;                                  /* 0 表示服务器没下发名单 */
     wchar_t names[NET_MAX_STUDENTS][NET_NAME_WCHARS];
+    int rosterRev;                               /* 名单版本号（服务器发布名单时 +1） */
+    char rosterMd5[33];                          /* 名单 md5（校验本地是否被改过） */
+    int subCount;                                /* 有成绩、且启用的科目数 */
+    NetSubject sub[NET_MAX_SUBJECTS];
 } NetSyncResult;
 
 /* 拉一次概率（如果服务器有名单，也一并拉下来）。

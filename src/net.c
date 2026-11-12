@@ -99,6 +99,54 @@ static int ReadAll(HINTERNET hr, char *resp, int cap)
     return 1;
 }
 
+/* 科目行：sub=<科目名>|<1 启用 / 0 停用>|<权重,逗号分隔>
+ * 一行一科，只有"有成绩"的科目才会下发；一行都没有就是没有科目数据。 */
+static void ParseSubjects(const char *resp, NetSyncResult *out)
+{
+    const char *p = resp;
+
+    out->subCount = 0;
+    while (p && (p = strstr(p, "sub=")) != NULL) {
+        const char *e;
+        const char *b1, *b2;
+
+        if (p != resp && p[-1] != '\n') { p += 4; continue; }   /* 必须整行开头 */
+        e = p + 4;
+        while (*e && *e != '\r' && *e != '\n') e++;
+
+        b1 = (const char *)memchr(p + 4, '|', (size_t)(e - (p + 4)));
+        b2 = b1 ? (const char *)memchr(b1 + 1, '|', (size_t)(e - b1 - 1)) : NULL;
+        if (b1 && b2 && out->subCount < NET_MAX_SUBJECTS) {
+            NetSubject *s = &out->sub[out->subCount];
+            int len = (int)(b1 - (p + 4));
+            int wl, i = 0;
+            const char *q = b2 + 1;
+
+            if (len > NET_SUBJECT_WCHARS - 1) len = NET_SUBJECT_WCHARS - 1;
+            wl = MultiByteToWideChar(CP_UTF8, 0, p + 4, len, s->name, NET_SUBJECT_WCHARS - 1);
+            s->name[wl > 0 ? wl : 0] = 0;
+
+            s->enabled = (b1[1] == '1');
+
+            while (i < NET_MAX_STUDENTS && q < e) {
+                char *end = NULL;
+                double v = strtod(q, &end);
+                if (end == q) break;
+                if (v < 0) v = 0;
+                if (v > 1000) v = 1000;
+                s->w[i++] = v;
+                q = end;
+                while (q < e && (*q == ',' || *q == ' ')) q++;
+            }
+            s->wCount = i;
+
+            /* 停用的科目也算"有数据"（要记住它存在），但菜单里不显示 */
+            if (s->name[0]) out->subCount++;
+        }
+        p = (*e) ? e + 1 : e;
+    }
+}
+
 static void ParseWeights(const char *p, NetSyncResult *out)
 {
     int i = 0;
@@ -115,13 +163,19 @@ static void ParseWeights(const char *p, NetSyncResult *out)
     out->wCount = i;
 }
 
-/* 名单是 UTF-8、用 '|' 分隔 */
+/* 名单是 UTF-8、用 '|' 分隔。只吃这一行：换行就停，
+ * 否则后面的 sub=/nx= 行会被当成名字切进来。 */
 static void ParseNames(const char *p, NetSyncResult *out)
 {
     int n = 0;
-    while (*p && n < NET_MAX_STUDENTS) {
+    while (*p && *p != '\r' && *p != '\n' && n < NET_MAX_STUDENTS) {
         const char *q = strchr(p, '|');
-        int len = q ? (int)(q - p) : (int)strlen(p);
+        const char *e = p;
+        int len;
+
+        while (*e && *e != '\r' && *e != '\n') e++;
+        if (q && q > e) q = NULL;          /* '|' 在下一行，不算 */
+        len = q ? (int)(q - p) : (int)(e - p);
         if (len > 0) {
             int wlen = MultiByteToWideChar(CP_UTF8, 0, p, len, out->names[n], NET_NAME_WCHARS - 1);
             if (wlen > 0) {
@@ -185,6 +239,23 @@ static int ParseResponse(const char *resp, NetSyncResult *out)
 
     ParseWeights(pw + 3, out);
     if (pn) ParseNames(pn + 3, out);
+    ParseSubjects(resp, out);
+
+    /* 名单版本 + md5：服务器只有在下发名单时才带这两行 */
+    {
+        const char *prv = strstr(resp, "\nrv=");
+        const char *prm = strstr(resp, "\nrm=");
+        if (prv) out->rosterRev = (int)_strtoi64(prv + 4, NULL, 10);
+        if (prm) {
+            const char *p = prm + 4;
+            int i = 0;
+            while (p[i] && p[i] != '\r' && p[i] != '\n' && i < 32) {
+                out->rosterMd5[i] = p[i];
+                i++;
+            }
+            out->rosterMd5[i] = 0;
+        }
+    }
 
     return out->wCount > 0 || out->nCount > 0;
 }

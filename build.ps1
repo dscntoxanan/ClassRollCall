@@ -6,6 +6,11 @@
 param(
     [switch]$Sign,
     [switch]$KeepSymbols,
+    # The roster baked into the exe is only used ONCE: on first run, when the
+    # local config (%APPDATA%\XananRollCall\state.dat) does not exist yet, it is
+    # written there and from then on the config is the only source of names.
+    # -NoRoster builds an exe with no names at all (config must be provided).
+    [switch]$NoRoster,
     # Which class this exe belongs to. Written into src/class.h (generated).
     [string]$Class = '',
     [string]$Key = '',
@@ -34,7 +39,11 @@ New-Item -ItemType Directory -Force -Path (Join-Path $root 'dist') | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $root 'build') | Out-Null
 
 Write-Host '[1/4] roster'
-& node (Join-Path $root 'tools\gen-roster.mjs') | Out-Host
+if ($NoRoster) {
+    & node (Join-Path $root 'tools\gen-roster.mjs') --empty | Out-Host
+} else {
+    & node (Join-Path $root 'tools\gen-roster.mjs') | Out-Host
+}
 
 # class.h: one exe = one class. Without -Class the existing file (or the
 # committed default c1) is kept, so a plain rebuild never rebinds a build.

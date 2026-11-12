@@ -5,5 +5,6 @@
 #define CLASS_CODE  L"c1"
 #define CLASS_NAME  L"<CLASS NAME>"
 #define SYNC_KEY    L"0123456789abcdef0123456789abcdef"
+#define MANIFEST_PORT_PART L""
 
 #endif
