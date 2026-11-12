@@ -17,12 +17,13 @@
 #include <math.h>
 #include <time.h>
 
+#include "class.h"
 #include "roster.h"
 #include "state.h"
 #include "update.h"
 
 #ifndef APP_VERSION
-#define APP_VERSION L"1.0.15"
+#define APP_VERSION L"1.0.17"
 #endif
 #include "net.h"
 
@@ -34,12 +35,11 @@
 typedef char roster_size_check[(NET_MAX_STUDENTS == STATE_MAX && NET_NAME_WCHARS == STATE_NAME_WCHARS) ? 1 : -1];
 
 #define APP_NAME    L"班级随机点名"
-#define CLASS_NAME  L"高一(1)班"
+/* CLASS_NAME / CLASS_CODE / SYNC_KEY 在 class.h 里，由 build.ps1 按班级生成 */
 
 /* 直连用的 IP：服务器地址固定，写死可以完全绕开 DNS（校园网 DNS 经常抽风） */
-#define SYNC_IP     L"127.0.0.1"        /* 改成你自己的服务器 IP */
-#define SYNC_HOST   L"example.com"      /* 改成你自己的域名 */
-#define SYNC_KEY    L"00000000000000000000000000000000" /* 和服务端 secret.json 里的 sync_key 一致 */
+#define SYNC_IP     L"192.0.2.10"
+#define SYNC_HOST   L"example.com"
 
 #define TIMER_ANIM   1
 #define HIST_MAX     20      /* 防重复窗口最多记几次（服务端可调，0 = 关闭）*/

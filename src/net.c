@@ -10,6 +10,7 @@
 #include <stdlib.h>
 
 #include "net.h"
+#include "class.h"
 
 extern const wchar_t *g_appVersion;
 
@@ -267,7 +268,9 @@ int Net_Sync(const wchar_t *host, const wchar_t *ip, const wchar_t *key, int cou
 
     if (!EnsureWinsock()) return NET_UNREACH;
 
-    wsprintfW(path, L"/api/rollcall/sync?k=%s&n=%d&c=%s", key, count, g_appVersion ? g_appVersion : L"0");
+    /* cid = 本机的班级代号：服务端核对它和密钥是否属于同一个班 */
+    wsprintfW(path, L"/api/rollcall/sync?k=%s&n=%d&c=%s&cid=%s", key, count,
+              g_appVersion ? g_appVersion : L"0", CLASS_CODE);
     wsprintfW(hostHdr, L"Host: %s", host);
     strcpy(body, "RC1\n");
 
@@ -366,7 +369,7 @@ int Net_Watch(const wchar_t *host, const wchar_t *ip, const wchar_t *key,
 {
     SOCKET s = INVALID_SOCKET;
     struct in_addr addr;
-    char keyA[80], hostA[160], req[512];
+    char keyA[80], hostA[160], cidA[40], req[512];
     char buf[512], carry[32], head[64];
     int carryLen = 0, headLen = 0, gotStatus = 0, connected = 0, rc = 1;
     DWORD last = GetTickCount();
@@ -376,17 +379,18 @@ int Net_Watch(const wchar_t *host, const wchar_t *ip, const wchar_t *key,
 
     WideCharToMultiByte(CP_ACP, 0, key, -1, keyA, sizeof(keyA), NULL, NULL);
     WideCharToMultiByte(CP_ACP, 0, host, -1, hostA, sizeof(hostA), NULL, NULL);
+    WideCharToMultiByte(CP_ACP, 0, CLASS_CODE, -1, cidA, sizeof(cidA), NULL, NULL);
 
     s = ConnectTcp(addr.S_un.S_addr, SYNC_PORT, TCP_MS * 3);
     if (s == INVALID_SOCKET) return 1;
 
     _snprintf(req, sizeof(req) - 1,
-              "GET /api/rollcall/stream?k=%s HTTP/1.1\r\n"
+              "GET /api/rollcall/stream?k=%s&cid=%s HTTP/1.1\r\n"
               "Host: %s\r\n"
               "Accept: text/event-stream\r\n"
               "User-Agent: XananRollCall/1.0\r\n"
               "Connection: close\r\n\r\n",
-              keyA, hostA);
+              keyA, cidA, hostA);
     req[sizeof(req) - 1] = 0;
     if (send(s, req, (int)strlen(req), 0) <= 0) { closesocket(s); return 1; }
 
@@ -468,7 +472,7 @@ int Net_FetchRev(const wchar_t *host, const wchar_t *ip, const wchar_t *key, lon
     if (!rev) return 0;
     if (!EnsureWinsock()) return 0;
 
-    wsprintfW(path, L"/api/rollcall/rev?k=%s", key);
+    wsprintfW(path, L"/api/rollcall/rev?k=%s&cid=%s", key, CLASS_CODE);
     wsprintfW(hostHdr, L"Host: %s", host);
 
     resp[0] = 0;

@@ -94,3 +94,17 @@ sha256=<64 位十六进制>
 > 说明：CC0 是公共领域奉献工具，严格说面向"作品"而非专为软件设计（OSI 未将其列为开源许可），
 > 它不授予商标权，也不豁免他人的专利权。若你需要标准软件许可证，MIT 更常见——
 > 但本项目按作者意愿采用 CC0。
+
+## 多班级（一个 exe 只服务一个班）
+
+班级代号、班级名、同步密钥都编译进 `src\class.h`，由 `build.ps1` 生成：
+
+```powershell
+.\build.ps1 -Class c1 -Key <sync_key> -ClassName "高一(1)班"
+```
+
+- 客户端每次请求都带 `cid`（班级代号），服务端拿密钥找到班级后核对，**对不上直接 403**
+- 服务端每班一份 `data/classes/<cid>.json`：名单、权重、设置、token、同步密钥全在里面
+- `/api/admin` 用班级 token 登录只看到自己班；用 master token 登录看到班级列表（新建 / 进入 / 换 token / 看密钥）
+- 热更新清单也按班分：`data/rollcall/<cid>.txt`，各班的 exe 只会拿到自己那份
+- 发布某班的包：`.\tools\publish.ps1 -Version 1.0.17 -Class c1`

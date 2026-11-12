@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include "update.h"
+#include "class.h"
 
 /* 由 main.c 提供 */
 extern const wchar_t *g_appVersion;
@@ -332,7 +333,8 @@ static void DoCheck(void)
     char ver[64], url[512], alt[512], sha[128];
     wchar_t wver[64], wurl[512], walt[512], wsha[128], tmp[MAX_PATH], pending[MAX_PATH];
 
-    if (!HttpGetText(L"http://" MANIFEST_HOST MANIFEST_PATH, manifest, sizeof(manifest))) return;
+    if (!HttpGetText(L"http://" MANIFEST_HOST MANIFEST_PATH L"?cid=" CLASS_CODE,
+                     manifest, sizeof(manifest))) return;
     if (!GetField(manifest, "ver", ver, sizeof(ver))) return;
     if (!GetField(manifest, "url", url, sizeof(url))) return;
 

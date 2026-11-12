@@ -30,7 +30,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 BASE = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE, "data")
 LOG_DIR = os.path.join(BASE, "logs")
-STATE_FILE = os.path.join(DATA_DIR, "state.json")
+CLASS_DIR = os.path.join(DATA_DIR, "classes")   # 一个班一个 JSON 文件
+STATE_FILE = os.path.join(DATA_DIR, "state.json")  # 老版本单班级状态，只用于迁移
 NAMES_FILE = os.path.join(DATA_DIR, "names.json")
 SECRET_FILE = os.path.join(BASE, "secret.json")
 LOG_FILE = os.path.join(LOG_DIR, "api.log")
@@ -41,6 +42,8 @@ MAX_WEIGHT = 100.0
 MAX_STUDENTS = 128
 MAX_STREAMS = 16          # 同时允许的 SSE 连接数
 STREAM_MAX_SECONDS = 1800 # 单条长连接最长存活时间，到点让客户端重连
+MAX_CLASSES = 60          # 最多开多少个班级
+MASTER_ID = "@master"     # 管理员会话的虚拟班级 id
 
 _lock = threading.Lock()
 _login_fail = {}          # ip -> [count, first_ts]
@@ -49,7 +52,7 @@ _stream_count = [0]       # 当前 SSE 长连接数
 _login_fail_lock = threading.Lock()
 
 DEFAULT_STATE = {
-    "class": "高一(1)班",
+    "class": "高一2618班",
     "names": [],
     "weights": [],
     "updated": 0,
@@ -66,10 +69,15 @@ DEFAULT_STATE = {
 }
 
 
+def _default_state():
+    """返回一份全新的状态字典（列表不能共用，否则各个班级会串）。"""
+    return json.loads(json.dumps(DEFAULT_STATE))
+
+
 # ---------------------------------------------------------------- 文件工具
 
 def ensure_dirs():
-    for d in (DATA_DIR, LOG_DIR):
+    for d in (DATA_DIR, LOG_DIR, CLASS_DIR):
         os.makedirs(d, exist_ok=True)
 
 
@@ -90,18 +98,25 @@ def save_json(path, obj):
     os.replace(tmp, path)
 
 
-def state_read():
-    st = load_json(STATE_FILE, None)
-    if not isinstance(st, dict):
-        st = dict(DEFAULT_STATE)
+# ---------------------------------------------------------------- 状态规范化
+
+def _state_normalize(st):
     for k, v in DEFAULT_STATE.items():
         st.setdefault(k, v)
+
     # 权重数量必须与名单一致
     n = len(st.get("names") or [])
     w = st.get("weights") or []
     if len(w) < n:
         w = list(w) + [1.0] * (n - len(w))
-    st["weights"] = w[:n] if n else w
+    w = w[:n] if n else w
+    clean = []
+    for x in w:
+        try:
+            clean.append(float(x))
+        except (TypeError, ValueError):
+            clean.append(1.0)
+    st["weights"] = clean
 
     # 自定义项：夹到合理范围，坏值直接回默认
     try:
@@ -138,8 +153,121 @@ def state_read():
     return st
 
 
-def state_write(st):
-    save_json(STATE_FILE, st)
+# ---------------------------------------------------------------- 班级（多租户）
+#
+# 一个班 = data/classes/<cid>.json：
+#   {"id","name","token_sha256","sync_key","created","state":{...}}
+# 后台用 token 认班级，客户端用 sync_key 认班级 —— 两边都只能碰到自己那一个。
+
+def _class_path(cid):
+    return os.path.join(CLASS_DIR, cid + ".json")
+
+
+def _cid_ok(cid):
+    if not cid or len(cid) > 32:
+        return False
+    return all((ch.isalnum() or ch in "-_") for ch in cid)
+
+
+def class_read(cid):
+    if not _cid_ok(cid):
+        return None
+    rec = load_json(_class_path(cid), None)
+    if not isinstance(rec, dict):
+        return None
+    rec["id"] = cid
+    st = rec.get("state")
+    rec["state"] = _state_normalize(st if isinstance(st, dict) else _default_state())
+    rec.setdefault("name", rec["state"].get("class") or cid)
+    return rec
+
+
+def class_write(rec):
+    save_json(_class_path(rec["id"]), rec)
+
+
+def class_all():
+    out = []
+    try:
+        files = sorted(os.listdir(CLASS_DIR))
+    except OSError:
+        return out
+    for fn in files:
+        if not fn.endswith(".json"):
+            continue
+        rec = class_read(fn[:-5])
+        if rec:
+            out.append(rec)
+    return out
+
+
+def class_by_token(sha):
+    if not sha:
+        return None
+    for rec in class_all():
+        if hmac.compare_digest(str(rec.get("token_sha256") or ""), sha):
+            return rec
+    return None
+
+
+def class_by_key(key):
+    if not key:
+        return None
+    for rec in class_all():
+        if hmac.compare_digest(str(rec.get("sync_key") or ""), key):
+            return rec
+    return None
+
+
+def class_create(name, names=None):
+    """新建班级，返回 (记录, 明文 token)。token 只在这里返回一次。"""
+    if len(class_all()) >= MAX_CLASSES:
+        return None, None
+    cid = "c" + os.urandom(3).hex()
+    while os.path.exists(_class_path(cid)):
+        cid = "c" + os.urandom(3).hex()
+    token = os.urandom(8).hex()
+    rec = {
+        "id": cid,
+        "name": name,
+        "token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+        "sync_key": os.urandom(16).hex(),
+        "created": int(time.time()),
+        "state": _default_state(),
+    }
+    rec["state"]["class"] = name
+    if names:
+        rec["state"]["names"] = list(names)[:MAX_STUDENTS]
+        rec["state"]["weights"] = [1.0] * len(rec["state"]["names"])
+    class_write(rec)
+    return rec, token
+
+
+def class_rotate_token(cid):
+    """换一把新 token，旧的立刻失效；返回明文（只此一次）。"""
+    rec = class_read(cid)
+    if not rec:
+        return None
+    token = os.urandom(8).hex()
+    rec["token_sha256"] = hashlib.sha256(token.encode()).hexdigest()
+    class_write(rec)
+    return token
+
+
+def state_read(cid):
+    rec = class_read(cid)
+    if not rec:
+        return _default_state()
+    return rec["state"]
+
+
+def state_write(cid, st):
+    rec = class_read(cid)
+    if not rec:
+        rec = {"id": cid, "name": st.get("class") or cid, "token_sha256": "",
+               "sync_key": os.urandom(16).hex(), "created": int(time.time())}
+    rec["state"] = st
+    class_write(rec)
 
 
 def log_line(msg):
@@ -154,40 +282,75 @@ def log_line(msg):
 
 def load_secret():
     s = load_json(SECRET_FILE, None)
-    if not isinstance(s, dict) or not s.get("token_sha256"):
+    if not isinstance(s, dict) or not (s.get("master_token_sha256") or s.get("token_sha256")):
         raise SystemExit("secret.json missing or invalid")
     return s
 
 
 SECRET = load_secret()
-COOKIE_SECRET = SECRET.get("cookie_secret", "").encode()
-SYNC_KEY = SECRET.get("sync_key", "")
-TOKEN_SHA = SECRET.get("token_sha256", "")
+COOKIE_SECRET = (SECRET.get("cookie_secret") or os.urandom(32).hex()).encode()
+MASTER_SHA = SECRET.get("master_token_sha256") or ""
 
 
-def make_session():
+def make_session(cid):
     exp = int(time.time()) + SESSION_TTL
-    sig = hmac.new(COOKIE_SECRET, str(exp).encode(), hashlib.sha256).hexdigest()
-    return "%d.%s" % (exp, sig)
+    msg = "%s.%d" % (cid, exp)
+    sig = hmac.new(COOKIE_SECRET, msg.encode(), hashlib.sha256).hexdigest()
+    return "%s.%s" % (msg, sig)
 
 
 def check_session(value):
-    if not value or "." not in value:
-        return False
-    exp_s, sig = value.rsplit(".", 1)
+    """Cookie 有效则返回班级 id（管理员是 @master），否则 None。"""
+    parts = (value or "").split(".")
+    if len(parts) != 3:
+        return None
+    cid, exp_s, sig = parts
     try:
         exp = int(exp_s)
     except ValueError:
-        return False
+        return None
     if exp < int(time.time()):
-        return False
-    want = hmac.new(COOKIE_SECRET, exp_s.encode(), hashlib.sha256).hexdigest()
-    return hmac.compare_digest(want, sig)
+        return None
+    want = hmac.new(COOKIE_SECRET, ("%s.%s" % (cid, exp_s)).encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(want, sig):
+        return None
+    if cid == MASTER_ID:
+        return cid
+    return cid if _cid_ok(cid) and os.path.exists(_class_path(cid)) else None
 
 
 def check_token(token):
+    """token 有效则返回对应班级 id（管理员是 @master），否则 None。"""
+    if not token:
+        return None
     got = hashlib.sha256(token.encode()).hexdigest()
-    return hmac.compare_digest(got, TOKEN_SHA)
+    if MASTER_SHA and hmac.compare_digest(got, MASTER_SHA):
+        return MASTER_ID
+    rec = class_by_token(got)
+    return rec["id"] if rec else None
+
+
+def migrate_legacy():
+    """老版本只有一个 secret.json + state.json：把它变成第一个班级 c1。"""
+    if class_all():
+        return
+    st = load_json(STATE_FILE, None)
+    tok = SECRET.get("token_sha256") or ""
+    key = SECRET.get("sync_key") or ""
+    if not isinstance(st, dict) and not tok:
+        return
+    if not isinstance(st, dict):
+        st = _default_state()
+    rec = {
+        "id": "c1",
+        "name": st.get("class") or "班级 1",
+        "token_sha256": tok,
+        "sync_key": key or os.urandom(16).hex(),
+        "created": int(time.time()),
+        "state": _state_normalize(st),
+    }
+    class_write(rec)
+    log_line("migrated legacy state.json -> c1")
 
 
 # ---------------------------------------------------------------- 页面
@@ -278,7 +441,7 @@ PANEL_HTML = """<!doctype html>
 </style></head><body>
 <header>
   <h1><span class="dot"></span>__CLASS__</h1>
-  <div class="meta">名单 __COUNT__ 人 · 上次同步 __LAST__</div>
+  <div class="meta">名单 __COUNT__ 人 · 上次同步 __LAST__ · 班级编号 __CID__</div>
   <div class="meta">权重 0 = 不参与常规抽取，数值越大越容易被抽中；改完点「保存修改」</div>
   <div class="meta">被抽到的人 30 分钟内权重自动 −0.2（最低 1.0，本来 ≤1 的不变）；客户端重启即恢复</div>
 </header>
@@ -422,12 +585,14 @@ document.getElementById('logout').onclick=async ()=>{
 </script></body></html>"""
 
 
-def admin_html(st):
+def admin_html(rec):
+    st = rec.get("state") or {}
     names = st.get("names") or []
     weights = st.get("weights") or []
     last = st.get("last_sync") or 0
     last_s = time.strftime("%m-%d %H:%M", time.localtime(last)) if last else "从未"
     html = PANEL_HTML
+    html = html.replace("__CID__", escape_html(rec.get("id") or ""))
     html = html.replace("__CLASS__", escape_html(st.get("class") or "班级"))
     html = html.replace("__COUNT__", str(len(names)))
     html = html.replace("__LAST__", last_s)
@@ -441,6 +606,137 @@ def admin_html(st):
     html = html.replace("__HD__", str(int(st.get("hist_draws") or 0)))
     html = html.replace("__RSM__", str(max(1, int(st.get("round_seconds") or 300) // 60)))
     return html
+
+
+MASTER_HTML = """<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>班级管理</title>
+<style>
+  :root{--bg:#fafaf8;--fg:#121315;--sub:#8c8c86;--line:#e6e4de;--dark:#181a1f}
+  *{box-sizing:border-box}
+  body{margin:0;padding:34px 22px 60px;background:var(--bg);color:var(--fg);
+       font:14px/1.6 "Microsoft YaHei","PingFang SC",system-ui,sans-serif}
+  .wrap{max-width:780px;margin:0 auto}
+  h1{margin:0 0 3px;font-size:18px;font-weight:600}
+  .meta{color:var(--sub);font-size:12.5px}
+  .card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px 18px 10px;margin-top:18px}
+  .row{display:flex;align-items:center;gap:9px;padding:11px 0;border-bottom:1px solid var(--line);flex-wrap:wrap}
+  .row:last-child{border-bottom:0}
+  .nm{font-weight:600}
+  button{border:1px solid var(--line);background:#fff;border-radius:8px;padding:6px 11px;
+         font:inherit;font-size:12.5px;color:var(--fg);cursor:pointer}
+  button:hover{background:#f2f0ea}
+  button.dark{background:var(--dark);color:#fff;border-color:var(--dark)}
+  input{height:38px;padding:0 11px;border:1px solid var(--line);border-radius:9px;font:inherit;outline:none}
+  input:focus{border-color:#c9c6bd}
+  textarea{width:100%;min-height:88px;padding:10px;border:1px solid var(--line);border-radius:9px;
+           font:13px/1.5 ui-monospace,Consolas,monospace;outline:none;resize:vertical}
+  .grid{display:flex;gap:9px;margin:12px 0}
+  .grid input{flex:1}
+  .out{margin-top:14px;padding:12px 14px;border:1px dashed #c9c6bd;border-radius:10px;
+       background:#fbfaf6;font:12.5px/1.9 ui-monospace,Consolas,monospace;display:none;word-break:break-all}
+  .toast{position:fixed;left:50%;bottom:26px;transform:translateX(-50%);background:var(--dark);color:#fff;
+         padding:9px 18px;border-radius:9px;font-size:13px;opacity:0;transition:.2s;pointer-events:none}
+  .toast.on{opacity:1}
+</style></head><body><div class="wrap">
+  <h1>班级管理</h1>
+  <div class="meta">每个班级有独立的 token 和独立的数据，互相看不见。</div>
+  <div class="card" id="list">__ROWS__</div>
+  <div class="card">
+    <div class="meta" style="margin-bottom:10px">新建班级</div>
+    <div class="grid">
+      <input id="cname" placeholder="班级名，例如 高一2618班" maxlength="40">
+      <button class="dark" id="mk">创建</button>
+    </div>
+    <div class="meta" style="margin-bottom:6px">名单（可选，每行一个名字）</div>
+    <textarea id="cnames" placeholder="张三&#10;李四"></textarea>
+    <div class="out" id="out"></div>
+  </div>
+  <div style="margin-top:18px"><button id="logout">退出</button></div>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+const toast=(m)=>{const t=document.getElementById('toast');t.textContent=m;t.classList.add('on');
+  clearTimeout(t._h);t._h=setTimeout(()=>t.classList.remove('on'),1800);};
+const show=(h)=>{const o=document.getElementById('out');o.innerHTML=h;o.style.display='block';};
+async function post(url,body){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-RC':'1'},
+    body:JSON.stringify(body||{})});
+  if(!r.ok) throw new Error(r.status);
+  return r.json();
+}
+document.querySelectorAll('[data-enter]').forEach(b=>b.onclick=async ()=>{
+  try{ await post('/api/admin/enter',{id:b.dataset.enter}); location.href='/api/admin'; }
+  catch(e){ toast('进入失败'); }});
+document.querySelectorAll('[data-tok]').forEach(b=>b.onclick=async ()=>{
+  if(!confirm('换掉后旧 token 立刻失效，确定？')) return;
+  try{ const r=await post('/api/admin/newtoken',{id:b.dataset.tok});
+       show('班级 '+b.dataset.tok+' 的新 token（只显示这一次）：<br><b>'+r.token+'</b>'); }
+  catch(e){ toast('失败'); }});
+document.querySelectorAll('[data-key]').forEach(b=>b.onclick=()=>{
+  show('班级 '+b.dataset.key+' 的同步密钥（写到客户端 class.ini 里）：<br><b>'+b.dataset.k+'</b>'); });
+
+document.getElementById('mk').onclick=async ()=>{
+  const name=document.getElementById('cname').value.trim();
+  if(!name){ toast('先写班级名'); return; }
+  const names=document.getElementById('cnames').value.split(/\\r?\\n/).map(s=>s.trim()).filter(Boolean);
+  try{
+    const r=await post('/api/admin/classes',{name,names});
+    show('班级已创建：<b>'+r.id+'</b><br>token（只显示这一次）：<b>'+r.token+'</b><br>'
+        +'同步密钥：<b>'+r.sync_key+'</b><br>把密钥写进客户端目录的 class.ini：<br>key='+r.sync_key);
+    toast('已创建，记下 token');
+    document.getElementById('cname').value='';
+    document.getElementById('cnames').value='';
+  }catch(e){ toast('创建失败：'+e.message); }
+};
+document.getElementById('logout').onclick=async()=>{
+  await fetch('/api/admin/logout',{method:'POST',headers:{'X-RC':'1'}});
+  location.reload();
+};
+</script></body></html>"""
+
+
+def classes_json():
+    out = []
+    for rec in class_all():
+        st = rec["state"]
+        out.append({
+            "id": rec["id"],
+            "name": rec.get("name") or st.get("class") or rec["id"],
+            "class": st.get("class") or "",
+            "count": len(st.get("names") or []),
+            "rev": int(st.get("rev") or 0),
+            "last_sync": int(st.get("last_sync") or 0),
+            "created": int(rec.get("created") or 0),
+        })
+    return {"ok": True, "classes": out}
+
+
+def master_html(_unused=None):
+    rows = []
+    for rec in class_all():
+        st = rec["state"]
+        last = st.get("last_sync") or 0
+        last_s = time.strftime("%m-%d %H:%M", time.localtime(last)) if last else "从未"
+        rows.append(
+            '<div class="row"><div style="flex:1;min-width:200px">'
+            '<div class="nm">%s</div>'
+            '<div class="meta">编号 %s · 名单 %d 人 · 上次同步 %s</div></div>'
+            '<button data-enter="%s">进入</button>'
+            '<button data-tok="%s">换 token</button>'
+            '<button data-key="%s" data-k="%s">看密钥</button></div>' % (
+                escape_html(st.get("class") or rec.get("name") or rec["id"]),
+                escape_html(rec["id"]),
+                len(st.get("names") or []),
+                last_s,
+                escape_html(rec["id"]),
+                escape_html(rec["id"]),
+                escape_html(rec["id"]),
+                escape_html(rec.get("sync_key") or "")))
+    if not rows:
+        rows = ['<div class="meta">还没有班级，下面新建一个。</div>']
+    return MASTER_HTML.replace("__ROWS__", "".join(rows))
 
 
 def escape_html(s):
@@ -533,7 +829,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "ok")
 
         if path == "/api/rollcall/version":
-            return self.version()
+            return self.version(q)
 
         if path == "/api/rollcall/stream":
             return self.stream(q)
@@ -542,18 +838,23 @@ class Handler(BaseHTTPRequestHandler):
             return self.rev(q)
 
         if path in ("/api/admin", "/api/admin/"):
-            if not self._authed():
+            cid = self._authed()
+            if not cid:
                 return self._send(200, LOGIN_HTML.replace("__ERROR__", ""), "text/html; charset=utf-8")
-            try:
-                st = state_read()
-            except Exception:
-                st = dict(DEFAULT_STATE)
-            return self._send(200, admin_html(st), "text/html; charset=utf-8")
+            if cid == MASTER_ID:
+                return self._send(200, master_html(None), "text/html; charset=utf-8")
+            rec = class_read(cid)
+            if not rec:
+                return self._redirect("/api/admin/logout")
+            return self._send(200, admin_html(rec), "text/html; charset=utf-8")
 
         if path == "/api/admin/state":
-            if not self._authed():
+            cid = self._authed()
+            if not cid:
                 return self._json(401, {"ok": False, "error": "unauthorized"})
-            return self._json(200, state_read())
+            if cid == MASTER_ID:
+                return self._json(200, classes_json())
+            return self._json(200, state_read(cid))
 
         return self._send(404, "not found")
 
@@ -569,7 +870,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.sync(q)
 
         if path == "/api/rollcall/version":
-            return self.version()
+            return self.version(q)
 
         if path == "/api/admin/login":
             return self.login()
@@ -585,6 +886,15 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/admin/next":
             return self.next_person()
+
+        if path == "/api/admin/classes":
+            return self.classes()
+
+        if path == "/api/admin/enter":
+            return self.enter()
+
+        if path == "/api/admin/newtoken":
+            return self.newtoken()
 
         return self._send(404, "not found")
 
@@ -604,7 +914,8 @@ class Handler(BaseHTTPRequestHandler):
         form = urllib.parse.parse_qs(body)
         token = (form.get("token") or [""])[0].strip()
 
-        if not token or not check_token(token):
+        cid = check_token(token)
+        if not cid:
             with _login_fail_lock:
                 rec = _login_fail.setdefault(ip, [0, now])
                 rec[0] += 1
@@ -614,11 +925,13 @@ class Handler(BaseHTTPRequestHandler):
         with _login_fail_lock:
             _login_fail.pop(ip, None)
         cookie = "rc_sess=%s; Path=/api; Max-Age=%d; HttpOnly; Secure; SameSite=Lax" % (
-            make_session(), SESSION_TTL)
+            make_session(cid), SESSION_TTL)
+        log_line("login ok: %s (%s)" % (cid, ip))
         return self._redirect("/api/admin", [("Set-Cookie", cookie)])
 
     def save(self):
-        if not self._authed():
+        cid = self._authed()
+        if not cid or cid == MASTER_ID:
             return self._json(401, {"ok": False, "error": "unauthorized"})
         if self.headers.get("X-RC") != "1":
             return self._json(403, {"ok": False, "error": "csrf"})
@@ -639,7 +952,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "error": "nothing to save"})
 
         with _lock:
-            st = state_read()
+            st = state_read(cid)
             n = len(st.get("names") or [])
 
             if weights is not None:
@@ -697,7 +1010,7 @@ class Handler(BaseHTTPRequestHandler):
 
             st["updated"] = int(time.time())
             st["rev"] = int(st.get("rev") or 0) + 1
-            state_write(st)
+            state_write(cid, st)
 
         log_line("saved: weights=%s rs=%s hd=%s" % (
             "yes" if weights is not None else "-",
@@ -708,19 +1021,31 @@ class Handler(BaseHTTPRequestHandler):
 
     def rev(self, q):
         """只返回状态版本号（几十字节），给轮询兜底用；不写任何状态。"""
-        key = (q.get("k") or [""])[0]
-        if not SYNC_KEY or not hmac.compare_digest(key, SYNC_KEY):
+        rec = class_by_key((q.get("k") or [""])[0])
+        if not rec:
+            return self._send(403, "forbidden")
+        cid = rec["id"]
+        # 客户端每次都会带上自己的班级代号；对不上就是别的班的客户端
+        want = (q.get("cid") or [""])[0]
+        if want and want != cid:
+            log_line("class mismatch: key->%s cid=%s ip=%s" % (cid, want, self._client_ip()))
             return self._send(403, "forbidden")
         with _lock:
-            r = int(state_read().get("rev") or 0)
+            r = int(state_read(cid).get("rev") or 0)
         return self._send(200, "rev=%d\n" % r)
     def stream(self, q):
         """SSE 长连接：状态里的 rev 一变就推一条，客户端收到后立刻重新同步。
 
         客户端不是浏览器，拿不到 Cookie，所以用同步密钥鉴权；此接口只读。
         """
-        key = (q.get("k") or [""])[0]
-        if not SYNC_KEY or not hmac.compare_digest(key, SYNC_KEY):
+        rec = class_by_key((q.get("k") or [""])[0])
+        if not rec:
+            return self._send(403, "forbidden")
+        cid = rec["id"]
+        # 客户端每次都会带上自己的班级代号；对不上就是别的班的客户端
+        want = (q.get("cid") or [""])[0]
+        if want and want != cid:
+            log_line("class mismatch: key->%s cid=%s ip=%s" % (cid, want, self._client_ip()))
             return self._send(403, "forbidden")
 
         with _stream_lock:
@@ -749,14 +1074,14 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             with _lock:
-                last = int(state_read().get("rev") or 0)
+                last = int(state_read(cid).get("rev") or 0)
             idle = 0
             deadline = time.time() + STREAM_MAX_SECONDS
 
             while time.time() < deadline:
                 time.sleep(1)
                 with _lock:
-                    rev = int(state_read().get("rev") or 0)
+                    rev = int(state_read(cid).get("rev") or 0)
                 if rev != last:
                     last = rev
                     try:
@@ -775,9 +1100,15 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             with _stream_lock:
                 _stream_count[0] -= 1
-    def version(self):
+    def version(self, q=None):
         """热更新清单：data/version.txt 原样返回（无缓存头）。"""
         p = os.path.join(DATA_DIR, "version.txt")
+        # 每个班可以有自己那份清单：data/rollcall/<cid>.txt
+        cid = ((q or {}).get("cid") or [""])[0]
+        if cid and _cid_ok(cid):
+            own = os.path.join(DATA_DIR, "rollcall", cid + ".txt")
+            if os.path.exists(own):
+                p = own
         try:
             with open(p, "r", encoding="utf-8") as f:
                 body = f.read()
@@ -786,8 +1117,14 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(200, body, "text/plain; charset=utf-8")
 
     def sync(self, q):
-        key = (q.get("k") or [""])[0]
-        if not SYNC_KEY or not hmac.compare_digest(key, SYNC_KEY):
+        rec = class_by_key((q.get("k") or [""])[0])
+        if not rec:
+            return self._send(403, "forbidden")
+        cid = rec["id"]
+        # 客户端每次都会带上自己的班级代号；对不上就是别的班的客户端
+        want = (q.get("cid") or [""])[0]
+        if want and want != cid:
+            log_line("class mismatch: key->%s cid=%s ip=%s" % (cid, want, self._client_ip()))
             return self._send(403, "forbidden")
         try:
             n = int((q.get("n") or ["0"])[0])
@@ -795,7 +1132,7 @@ class Handler(BaseHTTPRequestHandler):
             n = 0
 
         with _lock:
-            st = state_read()
+            st = state_read(cid)
             names = st.get("names") or []
             weights = st.get("weights") or []
             # 以服务器名单为准；只有当服务器没有名单时，才按客户端人数补齐
@@ -809,7 +1146,7 @@ class Handler(BaseHTTPRequestHandler):
                 st["weights"] = weights[:len(names)]
             st["last_sync"] = int(time.time())
             st["sync_count"] = int(st.get("sync_count") or 0) + 1
-            state_write(st)
+            state_write(cid, st)
 
         body = "RC1\nv=%d\nrs=%d\nhd=%d\nmp=%d\ndc=%d\nwm=%d\nnxi=%d\n" % (
             int(time.time()),
@@ -829,7 +1166,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def next_person(self):
         """指定下一位抽到的人（name 为空则取消指定）。"""
-        if not self._authed():
+        cid = self._authed()
+        if not cid or cid == MASTER_ID:
             return self._json(401, {"ok": False, "error": "unauthorized"})
         if self.headers.get("X-RC") != "1":
             return self._json(403, {"ok": False, "error": "csrf"})
@@ -840,7 +1178,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(400, {"ok": False, "error": "bad json"})
 
         with _lock:
-            st = state_read()
+            st = state_read(cid)
             names = st.get("names") or []
             if name and name not in names:
                 return self._json(400, {"ok": False, "error": "no such student"})
@@ -848,14 +1186,15 @@ class Handler(BaseHTTPRequestHandler):
             st["next_id"] = int(st.get("next_id") or 0) + 1
             st["updated"] = int(time.time())
             st["rev"] = int(st.get("rev") or 0) + 1
-            state_write(st)
+            state_write(cid, st)
 
         log_line("next person: %s" % (name or "(cleared)"))
         return self._json(200, {"ok": True, "next_name": name, "next_id": st["next_id"]})
 
     def roster(self):
         """整份替换名单：新增 / 删除都走这里；同名的人保留原权重。"""
-        if not self._authed():
+        cid = self._authed()
+        if not cid or cid == MASTER_ID:
             return self._json(401, {"ok": False, "error": "unauthorized"})
         if self.headers.get("X-RC") != "1":
             return self._json(403, {"ok": False, "error": "csrf"})
@@ -880,7 +1219,7 @@ class Handler(BaseHTTPRequestHandler):
             clean.append(nm)
 
         with _lock:
-            st = state_read()
+            st = state_read(cid)
             old_names = st.get("names") or []
             old_w = st.get("weights") or []
             by_name = {n: w for n, w in zip(old_names, old_w)}
@@ -888,10 +1227,82 @@ class Handler(BaseHTTPRequestHandler):
             st["weights"] = [float(by_name.get(n, 1.0)) for n in clean]
             st["updated"] = int(time.time())
             st["rev"] = int(st.get("rev") or 0) + 1
-            state_write(st)
+            state_write(cid, st)
 
         log_line("roster updated: %d students" % len(clean))
         return self._json(200, {"ok": True, "count": len(clean)})
+
+    # -- 班级管理（只有管理员能用）----------------------------------------
+    def _master(self):
+        return self._authed() == MASTER_ID
+
+    def classes(self):
+        if not self._master():
+            return self._json(401, {"ok": False, "error": "unauthorized"})
+        if self.headers.get("X-RC") != "1":
+            return self._json(403, {"ok": False, "error": "csrf"})
+        try:
+            payload = json.loads(self._body().decode("utf-8"))
+            name = str(payload.get("name") or "").strip()
+            names = payload.get("names") or []
+        except (ValueError, KeyError, AttributeError):
+            return self._json(400, {"ok": False, "error": "bad json"})
+        if not name or len(name) > 40:
+            return self._json(400, {"ok": False, "error": "bad name"})
+        clean = []
+        for nm in names:
+            if not isinstance(nm, str):
+                continue
+            nm = nm.strip()
+            if nm and len(nm) <= 12 and "|" not in nm:
+                clean.append(nm)
+        if len(clean) > MAX_STUDENTS:
+            return self._json(400, {"ok": False, "error": "too many students"})
+
+        with _lock:
+            rec, token = class_create(name, clean)
+        if not rec:
+            return self._json(400, {"ok": False, "error": "too many classes"})
+        log_line("class created: %s (%s, %d students)" % (rec["id"], name, len(clean)))
+        return self._json(200, {"ok": True, "id": rec["id"], "token": token,
+                                "sync_key": rec["sync_key"], "name": name})
+
+    def enter(self):
+        """管理员以某个班级的身份进入它的后台（拿到该班级的会话）。"""
+        if not self._master():
+            return self._json(401, {"ok": False, "error": "unauthorized"})
+        if self.headers.get("X-RC") != "1":
+            return self._json(403, {"ok": False, "error": "csrf"})
+        try:
+            payload = json.loads(self._body().decode("utf-8"))
+            tid = str(payload.get("id") or "").strip()
+        except (ValueError, KeyError, AttributeError):
+            return self._json(400, {"ok": False, "error": "bad json"})
+        if not class_read(tid):
+            return self._json(404, {"ok": False, "error": "no such class"})
+        cookie = "rc_sess=%s; Path=/api; Max-Age=%d; HttpOnly; Secure; SameSite=Lax" % (
+            make_session(tid), SESSION_TTL)
+        log_line("master entered %s" % tid)
+        return self._json(200, {"ok": True, "id": tid}, [("Set-Cookie", cookie)])
+
+    def newtoken(self):
+        """给某个班级换一把新 token（旧的立刻失效），明文只返回一次。"""
+        if not self._master():
+            return self._json(401, {"ok": False, "error": "unauthorized"})
+        if self.headers.get("X-RC") != "1":
+            return self._json(403, {"ok": False, "error": "csrf"})
+        try:
+            payload = json.loads(self._body().decode("utf-8"))
+            tid = str(payload.get("id") or "").strip()
+        except (ValueError, KeyError, AttributeError):
+            return self._json(400, {"ok": False, "error": "bad json"})
+        with _lock:
+            token = class_rotate_token(tid)
+        if not token:
+            return self._json(404, {"ok": False, "error": "no such class"})
+        log_line("token rotated: %s" % tid)
+        return self._json(200, {"ok": True, "id": tid, "token": token})
+
 
 
 def apply_roster():
@@ -910,11 +1321,12 @@ def apply_roster():
     if not isinstance(names, list) or not all(isinstance(x, str) for x in names):
         return
 
-    st = state_read()
+    cid = "c1"     # 种子名单只往第一个班级灌
+    st = state_read(cid)
     if st.get("names") and not force:
         if cls:
             st["class"] = cls
-            state_write(st)
+            state_write(cid, st)
         return
 
     old_names = st.get("names") or []
@@ -928,11 +1340,12 @@ def apply_roster():
     st["weights"] = [float(by_name.get(nm, 1.0)) for nm in names]
     if cls:
         st["class"] = cls
-    state_write(st)
+    state_write(cid, st)
 
 
 def main():
     ensure_dirs()
+    migrate_legacy()
     if os.path.exists(NAMES_FILE):
         apply_roster()
     httpd = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
